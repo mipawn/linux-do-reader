@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "LINUX DO 阅读器",
-  "version": "1.5.0",
+  "version": "1.6.0",
   "description": "在 Linux.do 使用顶部导航、双栏话题列表与逐楼带时间的回复树。",
   "icons": { "32": "icon.png", "128": "icon.png" },
   "action": { "default_title": "打开 LINUX DO 阅读器", "default_icon": "icon.png" },
@@ -9,7 +9,12 @@
   "content_scripts": [{
     "matches": ["https://linux.do/*"],
     "css": ["launcher.css"],
-    "js": ["forum.js", "reader.js"],
+    "js": ["forum.js", "reading.js", "reader.js"],
+    "run_at": "document_start"
+  }, {
+    "matches": ["https://linux.do/*"],
+    "js": ["bridge.js"],
+    "world": "MAIN",
     "run_at": "document_start"
   }],
   "web_accessible_resources": [{

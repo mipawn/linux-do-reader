@@ -11,9 +11,15 @@ default_destination = root / "dist" / f"linux-do-reader-{version}.zip"
 destination = Path(sys.argv[1]).expanduser().resolve() if len(sys.argv) == 2 else default_destination
 
 assets = (
+    "LICENSE",
+    "NOTICE",
+    "README.md",
+    "PRIVACY.md",
     "manifest.json",
     "background.js",
+    "bridge.js",
     "forum.js",
+    "reading.js",
     "reader.js",
     "reader.css",
     "launcher.css",

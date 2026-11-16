@@ -31,14 +31,14 @@
     return url.pathname + url.search;
   }
 
-  async function request(path, { signal, method = "GET", body, csrf } = {}) {
+  async function request(path, { signal, method = "GET", body, csrf, keepalive = false, headers: extraHeaders } = {}) {
     const url = safeURL(path);
     if (url?.origin !== siteURL) throw new Error("原站返回了无效的地址。");
-    const headers = { Accept: "application/json", "X-Requested-With": "XMLHttpRequest" };
+    const headers = { Accept: "application/json", "X-Requested-With": "XMLHttpRequest", ...extraHeaders };
     if (csrf) headers["X-CSRF-Token"] = csrf;
     if (body) headers["Content-Type"] = "application/json";
     const response = await fetch(url.pathname + url.search, {
-      signal, method, headers, body: body && JSON.stringify(body),
+      signal, method, headers, body: body && JSON.stringify(body), keepalive,
       credentials: "same-origin", mode: "same-origin"
     });
     if (response.ok && response.status === 204) return {};
@@ -55,10 +55,37 @@
     throw error;
   }
 
-  async function change(path, method, body) {
-    const { csrf } = await request("/session/csrf.json");
-    if (!csrf) throw new Error("登录状态已失效，请在原站重新登录。");
-    return request(path, { method, body, csrf });
+  let csrfPromise;
+  function prepareCSRF() {
+    if (!csrfPromise) {
+      csrfPromise = request("/session/csrf.json", { keepalive: true }).then(({ csrf }) => {
+        if (!csrf) throw new Error("登录状态已失效，请在原站重新登录。");
+        return csrf;
+      }).catch(error => { csrfPromise = null; throw error; });
+    }
+    return csrfPromise;
+  }
+
+  async function change(path, method, body, options = {}) {
+    const csrf = await prepareCSRF();
+    try {
+      return await request(path, { ...options, method, body, csrf });
+    } catch (error) {
+      if (error.status !== 403) throw error;
+      csrfPromise = null;
+      return request(path, { ...options, method, body, csrf: await prepareCSRF() });
+    }
+  }
+
+  function visitTopic(id) {
+    return request(`/t/${Number(id)}.json?track_visit=true`, {
+      headers: { "Discourse-Track-View": "true", "Discourse-Track-View-Topic-Id": String(id) }
+    });
+  }
+
+  function recordReading(batch) {
+    // keepalive lets the final small batch survive a refresh or navigation.
+    return change("/topics/timings", "POST", batch, { keepalive: true });
   }
 
   async function account() {
@@ -214,6 +241,7 @@
 
   globalThis.LDForum = {
     siteURL, safeURL, dateLabel, request, change, account, topicPath, tagInfo, categoryPath,
+    prepareCSRF, visitTopic, recordReading,
     feedPath, feed, postsPage, replyTree, sidebar, cooked
   };
 })();

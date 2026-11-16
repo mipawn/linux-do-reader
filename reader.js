@@ -2,6 +2,7 @@
   if (globalThis.LDReaderReady) return;
   globalThis.LDReaderReady = true;
   const forum = globalThis.LDForum;
+  const reading = globalThis.LDReading;
   const extension = globalThis.chrome?.runtime;
   const asset = (name) => extension?.getURL ? extension.getURL(name) : name;
 
@@ -14,14 +15,47 @@
   const themes = new Map([["site", "跟随 Linux.do"], ["light", "浅色"], ["dark", "深色"]]);
   const number = new Intl.NumberFormat("zh-CN", { notation: "compact" });
   const state = {
-    view: "latest", category: null, tag: null, query: "", next: null, rows: [], categories: new Map(), tags: new Map(),
+    view: "latest", category: null, tag: null, query: "", initialFeedPath: null, next: null, rows: [], categories: new Map(), tags: new Map(),
     user: undefined, selected: null, detail: null, openMenu: null, sidebarMenu: null, onScreen: false
   };
   const outletClass = "ld-reader-active";
   let host, root, listRequest, topicRequest, outlet, modeSwitch, nativeHeader, headerObserver;
-  let pendingOpen = false, originalLocation, originalPosition, contextLoaded = false;
+  let pendingOpen = false, readerMode = true, originalLocation, originalPosition, contextLoaded = false;
+  let lastActivity = performance.now(), accountRequest, accountRetryAt = 0;
+  const readProgress = new Map();
+  const tracker = new reading.Tracker({
+    send: batch => state.user ? forum.recordReading(batch) : Promise.resolve(),
+    visit: id => forum.visitTopic(id),
+    acknowledge: acknowledgeReading
+  });
   let headerLogo;
   const $ = (selector) => root.querySelector(selector);
+
+  function acknowledgeReading(topicId, floors) {
+    if (!state.user || !floors.length) return;
+    const lastRead = Math.max(readProgress.get(topicId) || 0, ...floors);
+    readProgress.set(topicId, lastRead);
+    for (const topic of state.rows.filter(row => row.id === topicId)) {
+      topic.unseen = false;
+      topic.last_read_post_number = Math.max(topic.last_read_post_number || 0, lastRead);
+      topic.unread_posts = Math.max(0, (topic.highest_post_number || topic.posts_count || 0) - topic.last_read_post_number);
+    }
+    if (root && state.onScreen) renderList();
+    document.dispatchEvent(new CustomEvent("linux-do-reader:read", {
+      detail: JSON.stringify({ topicId, lastRead })
+    }));
+  }
+
+  function sampleReading() {
+    const pane = root && $("#read-scroll");
+    const blocked = state.openMenu || state.sidebarMenu || [...document.querySelectorAll(".d-modal, .modal-backdrop, .fk-d-menu, .chat-drawer")].some(node => {
+      const rect = node.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0 && getComputedStyle(node).visibility !== "hidden";
+    });
+    const active = state.onScreen && !blocked && state.user !== undefined && !document.hidden && document.hasFocus() &&
+      performance.now() - lastActivity < 180000 && pane?.getBoundingClientRect().width > 0;
+    tracker.sample(active ? reading.visiblePosts(root, pane) : [], !!active);
+  }
 
   function element(tag, className, content) {
     const node = document.createElement(tag);
@@ -226,7 +260,10 @@
   function topicRow(topic) {
     const selected = state.selected?.id === topic.id;
     const row = element("article", "topic-row" + (selected ? " selected" : ""));
-    const summary = button("", "topic", { className: "topic-select", value: topic.id });
+    const summary = anchor("", forum.topicPath(topic), "topic-select");
+    summary.removeAttribute("target");
+    summary.dataset.action = "topic";
+    summary.dataset.value = topic.id;
     summary.setAttribute("aria-current", selected ? "true" : "false");
     const marker = element("span", topic.pinned || topic.pinned_globally ? "pinned-dot" : "unseen-dot");
     if (topic.pinned || topic.pinned_globally) marker.title = "置顶";
@@ -281,7 +318,7 @@
     listRequest?.abort();
     const controller = new AbortController();
     listRequest = controller;
-    const path = append ? state.next : forum.feedPath(state.view, state.category, state.tag, state.query, state.categories);
+    const path = append ? state.next : state.initialFeedPath || forum.feedPath(state.view, state.category, state.tag, state.query, state.categories);
     state.listBusy = true;
     state.listError = null;
     if (!append && !keepTopic) {
@@ -296,7 +333,15 @@
       const data = await forum.feed(path, controller.signal);
       if (controller.signal.aborted) return;
       const unique = new Map((append ? state.rows : []).map(row => [row.id, row]));
-      for (const row of data.rows) unique.set(row.id, row);
+      for (const row of data.rows) {
+        const lastRead = readProgress.get(row.id);
+        if (lastRead) {
+          row.unseen = false;
+          row.last_read_post_number = Math.max(row.last_read_post_number || 0, lastRead);
+          row.unread_posts = Math.max(0, (row.highest_post_number || row.posts_count || 0) - row.last_read_post_number);
+        }
+        unique.set(row.id, row);
+      }
       state.rows = [...unique.values()];
       state.next = data.next === path ? null : data.next;
       rememberTags(data.tags);
@@ -312,13 +357,15 @@
   }
 
   function switchFeed(view, category = null, tag = null, query = "") {
-    Object.assign(state, { view, category, tag, query });
+    Object.assign(state, { view, category, tag, query, initialFeedPath: null });
     closeMenu();
     renderFilters();
     loadList();
   }
 
   function clearTopic() {
+    sampleReading();
+    tracker.stop();
     topicRequest?.abort();
     state.selected = null;
     state.detail = null;
@@ -340,6 +387,9 @@
     if (activate) openTopicInView();
     closeMenu();
     if (state.selected?.id === topic.id && state.detail) return;
+    sampleReading();
+    tracker.stop();
+    lastActivity = performance.now();
     topicRequest?.abort();
     const controller = new AbortController();
     topicRequest = controller;
@@ -358,6 +408,7 @@
       const stream = data.post_stream.stream || [...posts.keys()];
       state.detail = { data, stream, posts, attempted: new Set(posts.keys()), collapsed: new Set(), controller,
         pendingFloor: initialFloor || null, moreBusy: false };
+      tracker.start(data.id);
       rememberTags(data.tags);
       renderReading();
       if (initialFloor && initialFloor > 1) focusPost(initialFloor, false);
@@ -427,7 +478,9 @@
     } else header.append(date(data.created_at));
     const tags = (data.tags || []).slice(0, 12);
     if (tags.length) header.append(add(element("div", "chips article-tags"), ...tags.map(tag => tagPill(tag))));
-    content.append(header, add(element("article", "op-content"), postContent(op)));
+    const mainPost = add(element("article", "op-content"), postContent(op));
+    if (op) mainPost.dataset.postNumber = op.post_number;
+    content.append(header, mainPost);
     if (detail.pendingFloor && ![...detail.posts.values()].some(post => post.post_number === detail.pendingFloor)) {
       content.append(anchor(`在原站查看 #${detail.pendingFloor}`, forum.topicPath(data, detail.pendingFloor), "secondary-button", "out"));
     }
@@ -474,6 +527,7 @@
         track.append(toggle);
       } else track.append(element("span", "branch-dot"));
       const article = element("article", "reply-card");
+      article.dataset.postNumber = floor;
       const head = add(element("div", "reply-header"), replyPerson(post, post.user_id != null && post.user_id === data.user_id),
         add(element("div", "reply-meta"), date(post.created_at), anchor("#" + floor, forum.topicPath(data, floor), "floor")));
       article.append(head);
@@ -840,6 +894,9 @@
         $(".topic-row.selected .topic-select")?.focus({ preventScroll: true });
         break;
       case "topic": {
+        // Keep native Cmd/Ctrl-click, Shift-click and middle-click semantics.
+        if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey || event.button > 0) return;
+        event.preventDefault();
         const row = state.rows.find(topic => topic.id === Number(value));
         if (row) selectTopic(row);
         if (host.clientWidth <= 760) $(".mobile-back").focus({ preventScroll: true });
@@ -893,11 +950,26 @@
     }
   }
 
+  function loadAccount() {
+    if (accountRequest) return accountRequest;
+    if (performance.now() < accountRetryAt) return Promise.resolve();
+    accountRequest = forum.account().then(user => {
+      state.user = user;
+      if (user) void forum.prepareCSRF().catch(() => {});
+    }).catch(error => {
+      accountRetryAt = performance.now() + 30000;
+      throw error;
+    }).finally(() => { accountRequest = null; });
+    return accountRequest;
+  }
+
   async function loadContext() {
     const operations = [
-      forum.account().then(user => { state.user = user; }),
+      loadAccount(),
       forum.request("/site.json").then(site => {
         state.categories = new Map((site.categories || []).map(category => [category.id, category]));
+        if (state.category) state.category = state.categories.get(state.category.id) || state.category;
+        renderFilters();
         rememberTags(site.top_tags);
         rememberTags(site.navigation_menu_site_top_tags);
         renderList();
@@ -951,8 +1023,12 @@
     if (headerLogo.source.getAttribute("media") !== media) headerLogo.source.setAttribute("media", media);
   }
 
-  function hideReader(restore = true) {
+  function hideReader(restore = true, preserveMode = false) {
+    if (!preserveMode) readerMode = false;
     pendingOpen = false;
+    sampleReading();
+    void tracker.flush();
+    tracker.resetClock();
     if (!state.onScreen) return;
     closeMenu();
     closeSidebar();
@@ -987,7 +1063,10 @@
       nativeHeader = header;
       if (header) headerObserver.observe(header);
     }
-    if (state.onScreen && (outlet !== siteOutlet || !host.isConnected)) hideReader(false);
+    if (state.onScreen && (outlet !== siteOutlet || !host.isConnected)) {
+      hideReader(false, true);
+      pendingOpen = readerMode && reading.readerRoute(location.pathname);
+    }
     outlet = siteOutlet;
     if (pendingOpen && modeSwitch.isConnected && outlet) showReader();
     if (state.onScreen) syncHeaderLogo();
@@ -995,6 +1074,9 @@
   }
 
   function showReader() {
+    readerMode = true;
+    lastActivity = performance.now();
+    tracker.resetClock();
     if (state.onScreen) return;
     if (!outlet?.isConnected || !modeSwitch?.isConnected) {
       pendingOpen = true;
@@ -1021,10 +1103,12 @@
     }
     if (pageChanged || (!state.rows.length && !state.listBusy)) {
       const topicRoute = location.pathname.match(/^\/t\/(?:([^/]+)\/)?(\d+)(?:\/(\d+))?\/?$/);
-      const mode = location.pathname.slice(1);
+      const route = reading.feedRoute(location.pathname, location.search);
       Object.assign(state, {
-        view: modes.has(mode) || mode === "bookmarks" ? mode : "latest",
-        category: null, tag: null, query: ""
+        view: route.view, initialFeedPath: topicRoute ? null : route.path,
+        category: route.categoryId ? state.categories.get(route.categoryId) || { id: route.categoryId, slug: route.categorySlug, name: route.categorySlug } : null,
+        tag: route.tagSlug ? { slug: route.tagSlug, name: route.tagSlug, id: route.tagId } : null,
+        query: ""
       });
       renderFilters();
       if (topicRoute) {
@@ -1035,7 +1119,10 @@
   }
 
   function applyNativeNavigation() {
-    if (state.onScreen && originalLocation !== location.pathname + location.search) hideReader(false);
+    if (state.onScreen && originalLocation === location.pathname + location.search) return;
+    if (state.onScreen) hideReader(false, true);
+    pendingOpen = readerMode && reading.readerRoute(location.pathname);
+    if (pendingOpen) syncNativeLayout();
   }
 
   extension?.onMessage?.addListener((message, sender, respond) => {
@@ -1097,6 +1184,22 @@
       if (event.key === "Escape" && !event.defaultPrevented && state.sidebarMenu && !event.target.closest?.(".fk-d-menu, .d-modal")) closeSidebar(true);
     });
     if (requestedAtStart || requestedURL()) openFromURL();
+    else if (reading.readerRoute(location.pathname)) showReader();
+    for (const type of ["pointerdown", "pointermove", "keydown", "wheel", "scroll"]) {
+      document.addEventListener(type, () => { lastActivity = performance.now(); }, { capture: true, passive: true });
+    }
+    document.addEventListener("visibilitychange", () => {
+      tracker.resetClock();
+      if (document.hidden) void tracker.flush();
+    });
+    window.addEventListener("blur", () => { tracker.resetClock(); void tracker.flush(); });
+    window.addEventListener("focus", () => { lastActivity = performance.now(); tracker.resetClock(); });
+    window.addEventListener("pagehide", () => { sampleReading(); void tracker.flush({ force: true }); });
+    setInterval(sampleReading, 1000);
+    setInterval(() => {
+      if (state.user !== undefined) void tracker.flush();
+      else if (state.onScreen) void loadAccount().catch(() => {});
+    }, 10000);
     window.addEventListener("hashchange", () => { if (requestedURL()) openFromURL(); });
   }
 
