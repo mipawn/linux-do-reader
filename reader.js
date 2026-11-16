@@ -11,6 +11,7 @@
   ]);
   const privateModes = new Set(["new", "unseen", "posted", "read", "bookmarks", "following"]);
   const levels = new Map([[3, "关注"], [2, "跟踪"], [1, "常规"], [0, "静音"]]);
+  const themes = new Map([["site", "跟随 Linux.do"], ["light", "浅色"], ["dark", "深色"]]);
   const sidebarGroups = new Map([
     ["community", "社区"], ["resources", "资源"], ["categories", "类别"], ["tags", "标签"], ["all", "原站导航"]
   ]);
@@ -171,7 +172,7 @@
     root.append(shell);
     try {
       const theme = localStorage.getItem("linux-do-reader-theme");
-      if (theme === "dark") host.dataset.theme = theme;
+      if (theme === "light" || theme === "dark") host.dataset.theme = theme;
     } catch {}
     $(".primary-nav").append(
       button("话题", "mode", { className: "nav-link", value: "latest", symbol: "list" }),
@@ -185,9 +186,10 @@
       $(".sidebar-nav").append(trigger);
     }
     $(".search-icon").append(icon("search"));
-    const themeToggle = button("阅读器深色模式", "theme", { className: "top-icon", symbol: "sun", iconOnly: true });
-    themeToggle.setAttribute("aria-pressed", String(host.dataset.theme === "dark"));
+    const themeToggle = button("配色", "menu", { className: "filter-button theme-toggle menu-toggle", symbol: "sun", value: "theme" });
+    themeToggle.setAttribute("aria-expanded", "false");
     $("#header-actions").append(themeToggle);
+    describeTheme();
     $(".filter-actions").append(
       button("筛类别", "menu", { className: "filter-button menu-toggle", symbol: "folder", value: "categories" }),
       button("筛标签", "menu", { className: "filter-button menu-toggle", symbol: "tag", value: "tags" }),
@@ -655,6 +657,15 @@
   function populateMenu(name) {
     const menu = $("#menu");
     menu.replaceChildren();
+    if (name === "theme") {
+      menu.append(element("h3", "popup-label", "阅读器配色"));
+      const current = host.dataset.theme || "site";
+      for (const [value, label] of themes) {
+        const select = button(label, "theme", { value, className: "popup-item" + (value === current ? " checked" : "") });
+        select.setAttribute("aria-pressed", String(value === current));
+        menu.append(select);
+      }
+    }
     if (name === "categories" || name === "tags") {
       const isCategory = name === "categories";
       const input = element("input", "popup-search");
@@ -808,14 +819,20 @@
     noticeTimer = setTimeout(() => { toast.hidden = true; }, 4200);
   }
 
-  function theme() {
-    const enabled = host.dataset.theme !== "dark";
-    if (enabled) host.dataset.theme = "dark";
-    else delete host.dataset.theme;
-    $('[data-action="theme"]').setAttribute("aria-pressed", String(enabled));
+  function describeTheme() {
+    const control = $('[data-value="theme"]');
+    control.title = "配色 · " + themes.get(host.dataset.theme || "site");
+    control.setAttribute("aria-label", control.title);
+  }
+
+  function setTheme(value) {
+    if (!themes.has(value)) return;
+    if (value === "site") delete host.dataset.theme;
+    else host.dataset.theme = value;
+    describeTheme();
     try {
-      if (enabled) localStorage.setItem("linux-do-reader-theme", "dark");
-      else localStorage.removeItem("linux-do-reader-theme");
+      if (value === "site") localStorage.removeItem("linux-do-reader-theme");
+      else localStorage.setItem("linux-do-reader-theme", value);
     } catch {}
   }
 
@@ -833,7 +850,7 @@
       case "tag": switchFeed("latest", state.category, control._readerTag || null); break;
       case "menu": openMenu(value, control); break;
       case "sidebar": openSidebar(value, control); break;
-      case "theme": theme(); break;
+      case "theme": setTheme(value); closeMenu(true); break;
       case "new-topic": newTopic(); break;
       case "back":
         $(".shell").dataset.reading = "false";

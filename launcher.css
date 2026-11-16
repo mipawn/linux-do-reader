@@ -72,6 +72,14 @@
   background: var(--secondary, #fff);
   box-shadow: 0 12px 30px #25221c24;
 }
+#main-outlet-wrapper > .sidebar-wrapper[data-ld-sidebar-theme="light"] {
+  --secondary: #fff;
+  --primary: #222;
+  --primary-high: #52565a;
+  --primary-low: #e7e8e9;
+  --primary-very-low: #f2f4f6;
+  --tertiary: #087fb8;
+}
 #main-outlet-wrapper > .sidebar-wrapper[data-ld-sidebar-theme="dark"] {
   --secondary: #2b3033;
   --primary: #dbe1e2;
