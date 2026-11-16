@@ -12,9 +12,6 @@
   const privateModes = new Set(["new", "unseen", "posted", "read", "bookmarks", "following"]);
   const levels = new Map([[3, "关注"], [2, "跟踪"], [1, "常规"], [0, "静音"]]);
   const themes = new Map([["site", "跟随 Linux.do"], ["light", "浅色"], ["dark", "深色"]]);
-  const sidebarGroups = new Map([
-    ["community", "社区"], ["resources", "资源"], ["categories", "类别"], ["tags", "标签"], ["all", "原站导航"]
-  ]);
   const number = new Intl.NumberFormat("zh-CN", { notation: "compact" });
   const state = {
     view: "latest", category: null, tag: null, query: "", next: null, rows: [], categories: new Map(), tags: new Map(),
@@ -23,6 +20,7 @@
   const outletClass = "ld-reader-active";
   let host, root, listRequest, topicRequest, outlet, modeSwitch, nativeHeader, headerObserver;
   let pendingOpen = false, originalLocation, originalPosition, contextLoaded = false;
+  let headerLogo;
   const $ = (selector) => root.querySelector(selector);
 
   function element(tag, className, content) {
@@ -141,7 +139,7 @@
         <div class="mainbar">
           <nav class="mainnav" aria-label="顶部导航">
             <div class="nav-group primary-nav"></div>
-            <div class="nav-group sidebar-nav" role="group" aria-label="原站导航"></div>
+            <div class="nav-group view-nav" role="group" aria-label="列表与导航"></div>
           </nav>
           <div class="header-tools">
             <form id="search-form" role="search">
@@ -150,14 +148,10 @@
             <div id="header-actions"></div>
           </div>
         </div>
-        <div class="filterbar">
-          <nav id="feeds" aria-label="话题筛选"></nav>
-          <div class="filter-actions"></div>
-        </div>
       </header>
       <div class="workspace">
         <section class="list-pane" aria-label="话题列表">
-          <div class="list-header"><div><h1 id="list-title">最新话题</h1><span id="list-count"></span></div><div id="list-tools"></div></div>
+          <div class="list-header"><h1 id="list-title">最新话题</h1><div id="list-tools"></div></div>
           <div id="list-scroll" class="list-scroll"><div id="rows"></div><div id="list-footer"></div></div>
         </section>
         <section id="reading-pane" class="reading-pane" aria-label="阅读区">
@@ -179,27 +173,21 @@
       button("收藏", "mode", { className: "nav-link", value: "bookmarks", symbol: "bookmark" }),
       button("关注", "mode", { className: "nav-link", value: "following", symbol: "bell" })
     );
-    for (const [value, label] of sidebarGroups) {
-      const trigger = button(label, "sidebar", { className: "nav-link menu-toggle", value });
-      trigger.setAttribute("aria-expanded", "false");
-      trigger.setAttribute("aria-controls", "d-sidebar");
-      $(".sidebar-nav").append(trigger);
-    }
+    const siteNavigation = button("原站导航", "sidebar", { className: "nav-link menu-toggle" });
+    $(".view-nav").append(
+      button("最新", "menu", { className: "nav-link menu-toggle", value: "feeds" }),
+      button("筛选", "menu", { className: "nav-link menu-toggle", value: "filters" }),
+      siteNavigation
+    );
+    for (const control of $(".view-nav").children) control.setAttribute("aria-expanded", "false");
     $(".search-icon").append(icon("search"));
     const themeToggle = button("配色", "menu", { className: "filter-button theme-toggle menu-toggle", symbol: "sun", value: "theme" });
     themeToggle.setAttribute("aria-expanded", "false");
-    $("#header-actions").append(themeToggle);
+    $("#header-actions").append(themeToggle, button("发帖", "new-topic", { className: "new-topic", symbol: "plus" }));
     describeTheme();
-    $(".filter-actions").append(
-      button("筛类别", "menu", { className: "filter-button menu-toggle", symbol: "folder", value: "categories" }),
-      button("筛标签", "menu", { className: "filter-button menu-toggle", symbol: "tag", value: "tags" }),
-      button("发帖", "new-topic", { className: "new-topic", symbol: "plus" })
-    );
-    for (const [mode, label] of modes) $("#feeds").append(button(label, "mode", { className: "feed-tab", value: mode }));
     $("#list-tools").append(button("刷新话题", "refresh", { className: "quiet-icon", symbol: "refresh", iconOnly: true }));
     $("#reading-back").append(
       button("返回列表", "back", { className: "mobile-back", symbol: "back" }),
-      element("span", "desktop-caption", "阅读区"),
       button("上一篇话题", "step", { className: "quiet-icon", symbol: "up", iconOnly: true, value: "-1" }),
       button("下一篇话题", "step", { className: "quiet-icon", symbol: "down", iconOnly: true, value: "1" })
     );
@@ -220,18 +208,13 @@
       item.classList.toggle("active", active);
       item.setAttribute("aria-pressed", String(active));
     }
-    for (const item of root.querySelectorAll(".feed-tab")) {
-      const active = item.dataset.value === state.view && !state.category && !state.tag;
-      item.classList.toggle("active", active);
-      item.setAttribute("aria-pressed", String(active));
-    }
-    for (const [name, value, symbol, placeholder] of [
-      ["categories", state.category?.name, "folder", "筛类别"], ["tags", state.tag?.name, "tag", "筛标签"]
-    ]) {
-      const item = $(`.filter-actions [data-value="${name}"]`);
-      item.classList.toggle("filtered", !!value);
-      item.replaceChildren(icon(symbol), document.createTextNode(value || placeholder));
-    }
+    const list = $('[data-value="feeds"]');
+    list.textContent = modes.get(state.view) || "列表";
+    list.setAttribute("aria-label", "话题列表 · " + list.textContent);
+    const filter = $('[data-value="filters"]');
+    const filters = [state.category?.name, state.tag?.name].filter(Boolean);
+    filter.classList.toggle("filtered", filters.length > 0);
+    filter.title = filters.length ? "筛选 · " + filters.join(" · ") : "筛选类别或标签";
     const title = {
       latest: "最新话题", new: "新话题", unseen: "未读话题", hot: "热门话题", top: "话题排行榜",
       bookmarks: "我的收藏", following: "我的关注", search: "搜索结果", posted: "我参与的话题", read: "已读话题"
@@ -277,7 +260,6 @@
     const focusedTopic = root.activeElement?.matches('.topic-select') && root.activeElement.dataset.value;
     rows.replaceChildren(...state.rows.map(topicRow));
     footer.replaceChildren();
-    $("#list-count").textContent = state.rows.length ? `已加载 ${state.rows.length} 条` : "";
     if (state.listError) {
       if (privateModes.has(state.view) && state.user === null) {
         footer.append(add(status("登录后即可查看这个列表。"), anchor("前往 Linux.do 登录", "/login", "secondary-button", "out")));
@@ -657,6 +639,23 @@
   function populateMenu(name) {
     const menu = $("#menu");
     menu.replaceChildren();
+    if (name === "feeds") {
+      for (const [value, label] of modes) {
+        const active = state.view === value && !state.category && !state.tag;
+        const select = button(label, "mode", { value, className: "popup-item" + (active ? " checked" : "") });
+        select.setAttribute("aria-pressed", String(active));
+        menu.append(select);
+      }
+    }
+    if (name === "filters") {
+      for (const [value, label, current, symbol] of [
+        ["categories", "类别", state.category, "folder"], ["tags", "标签", state.tag, "tag"]
+      ]) {
+        const item = button(label, "filter-section", { value, className: "popup-item", symbol });
+        item.append(element("span", "filter-value", current?.name || "不限"));
+        menu.append(item);
+      }
+    }
     if (name === "theme") {
       menu.append(element("h3", "popup-label", "阅读器配色"));
       const current = host.dataset.theme || "site";
@@ -672,7 +671,7 @@
       input.type = "search";
       input.placeholder = isCategory ? "查找类别" : "查找标签";
       input.setAttribute("aria-label", input.placeholder);
-      menu.append(input);
+      menu.append(button("返回筛选", "filter-section", { value: "filters", className: "popup-item", symbol: "back" }), input);
       const results = element("div", "popup-results");
       menu.append(results);
       const values = isCategory ? [...state.categories.values()] : [...state.tags.values()];
@@ -730,7 +729,7 @@
     menu.style.top = bottom + 8 + "px";
     menu.style.maxHeight = Math.max(160, innerHeight - bottom - 20) + "px";
     menu.hidden = false;
-    menu.querySelector("input, button, a")?.focus({ preventScroll: true });
+    (menu.querySelector("input") || menu.querySelector("button, a"))?.focus({ preventScroll: true });
   }
 
   function nativeSidebarButton() {
@@ -741,31 +740,13 @@
     return outlet?.parentElement?.querySelector(":scope > .sidebar-wrapper");
   }
 
-  function sidebarSection(nav, group) {
-    const sections = [...nav.querySelectorAll(".sidebar-section-wrapper")];
-    const titled = sections.map(section => [section, section.querySelector(".sidebar-section-header-text")?.textContent.trim()]);
-    if (group === "community") return sections.find(section => section.querySelector('a[href="/latest"]')) || sections[0];
-    if (group === "resources") return titled.find(([, name]) => /^(资源|Resources)$/i.test(name || ""))?.[0];
-    const route = group === "categories" ? "/c/" : "/tag/";
-    const title = group === "categories" ? /^(类别|分类|Categories)$/i : /^(标签|Tags)$/i;
-    return titled.find(([, name]) => title.test(name || ""))?.[0] || sections.find(section => section.querySelector(`a[href^="${route}"]`));
-  }
-
   function syncSidebar() {
     const menu = state.sidebarMenu;
     if (!menu) return;
     const sidebar = nativeSidebar();
     const nav = sidebar?.querySelector("#d-sidebar, .sidebar-container");
     if (!nav) return;
-    const section = menu.group === "all" ? null : sidebarSection(nav, menu.group);
-    const mode = section ? "section" : "all";
-    if (sidebar.dataset.ldSidebarMenu !== mode) sidebar.dataset.ldSidebarMenu = mode;
-    sidebar.dataset.ldSidebarTheme = host.dataset.theme || "site";
-    if (menu.section !== section) {
-      menu.section?.removeAttribute("data-ld-sidebar-section");
-      section?.setAttribute("data-ld-sidebar-section", "");
-      menu.section = section;
-    }
+    sidebar.setAttribute("data-ld-sidebar-menu", "");
     const { left, bottom } = menu.trigger.getBoundingClientRect();
     const width = Math.min(300, innerWidth - 24);
     const top = Math.round(bottom + 7);
@@ -776,7 +757,7 @@
     if (menu.panel !== sidebar) {
       menu.panel = sidebar;
       nav.querySelector(".sidebar-sections")?.scrollTo({ top: 0 });
-      (section || nav).querySelector("a[href], button")?.focus({ preventScroll: true });
+      nav.querySelector("a[href], button")?.focus({ preventScroll: true });
     }
   }
 
@@ -786,27 +767,22 @@
     state.sidebarMenu = null;
     menu.trigger.setAttribute("aria-expanded", "false");
     menu.panel?.removeAttribute("data-ld-sidebar-menu");
-    menu.panel?.removeAttribute("data-ld-sidebar-theme");
-    menu.section?.removeAttribute("data-ld-sidebar-section");
     if (menu.nativeWasClosed && nativeSidebarButton()?.getAttribute("aria-expanded") === "true") nativeSidebarButton().click();
     if (restoreFocus && menu.trigger.isConnected) menu.trigger.focus({ preventScroll: true });
   }
 
-  function openSidebar(group, trigger) {
+  function openSidebar(trigger) {
     closeMenu();
-    const previous = state.sidebarMenu;
-    if (previous?.trigger === trigger) { closeSidebar(true); return; }
-    previous?.trigger.setAttribute("aria-expanded", "false");
+    if (state.sidebarMenu) { closeSidebar(true); return; }
     const nativeButton = nativeSidebarButton();
-    const nativeWasClosed = previous?.nativeWasClosed ?? (nativeButton?.getAttribute("aria-expanded") === "false");
-    state.sidebarMenu = { group, trigger, nativeWasClosed, panel: previous?.panel, section: previous?.section };
+    const nativeWasClosed = nativeButton?.getAttribute("aria-expanded") === "false";
+    state.sidebarMenu = { trigger, nativeWasClosed };
     trigger.setAttribute("aria-expanded", "true");
-    if (!previous && nativeWasClosed) nativeButton.click();
+    if (nativeWasClosed) nativeButton.click();
     syncSidebar();
     if (!nativeButton && !state.sidebarMenu.panel) {
       closeSidebar();
-      if (group === "categories" || group === "tags") openMenu(group, trigger);
-      else notify("当前页面没有原站侧栏。可在首页打开原站导航。");
+      notify("当前页面没有原站侧栏。可在首页打开原站导航。");
     }
   }
 
@@ -829,6 +805,7 @@
     if (!themes.has(value)) return;
     if (value === "site") delete host.dataset.theme;
     else host.dataset.theme = value;
+    syncDocumentTheme();
     describeTheme();
     try {
       if (value === "site") localStorage.removeItem("linux-do-reader-theme");
@@ -845,11 +822,17 @@
     if (action !== "sidebar") closeSidebar();
     if (!control) return;
     switch (action) {
-      case "mode": switchFeed(value); break;
+      case "mode": closeMenu(true); switchFeed(value); break;
       case "category": switchFeed("latest", state.categories.get(Number(value)) || null, state.tag); break;
       case "tag": switchFeed("latest", state.category, control._readerTag || null); break;
       case "menu": openMenu(value, control); break;
-      case "sidebar": openSidebar(value, control); break;
+      case "sidebar": openSidebar(control); break;
+      case "filter-section": {
+        state.openMenu.name = value;
+        populateMenu(value);
+        ($("#menu input") || $("#menu button"))?.focus({ preventScroll: true });
+        break;
+      }
       case "theme": setTheme(value); closeMenu(true); break;
       case "new-topic": newTopic(); break;
       case "back":
@@ -945,12 +928,36 @@
     original.setAttribute("aria-pressed", String(!state.onScreen));
   }
 
+  function syncDocumentTheme() {
+    const theme = state.onScreen && host.dataset.theme;
+    if (theme) document.documentElement.dataset.ldReaderTheme = theme;
+    else delete document.documentElement.dataset.ldReaderTheme;
+    syncHeaderLogo();
+  }
+
+  function syncHeaderLogo() {
+    const theme = document.documentElement.dataset.ldReaderTheme;
+    if (headerLogo && (!theme || !nativeHeader?.contains(headerLogo.source))) {
+      headerLogo.source.setAttribute("media", headerLogo.media);
+      headerLogo = null;
+    }
+    if (!theme) return;
+    if (!headerLogo) {
+      const source = nativeHeader?.querySelector('.home-logo-wrapper-outlet picture source[media*="prefers-color-scheme: dark"]');
+      if (!source) return;
+      headerLogo = { source, media: source.getAttribute("media") };
+    }
+    const media = theme === "dark" ? "all" : "not all";
+    if (headerLogo.source.getAttribute("media") !== media) headerLogo.source.setAttribute("media", media);
+  }
+
   function hideReader(restore = true) {
     pendingOpen = false;
     if (!state.onScreen) return;
     closeMenu();
     closeSidebar();
     state.onScreen = false;
+    syncDocumentTheme();
     updateMode();
     outlet?.classList.remove(outletClass);
     host.hidden = true;
@@ -983,6 +990,7 @@
     if (state.onScreen && (outlet !== siteOutlet || !host.isConnected)) hideReader(false);
     outlet = siteOutlet;
     if (pendingOpen && modeSwitch.isConnected && outlet) showReader();
+    if (state.onScreen) syncHeaderLogo();
     syncSidebar();
   }
 
@@ -1002,6 +1010,7 @@
     outlet.classList.add(outletClass);
     state.onScreen = true;
     host.hidden = false;
+    syncDocumentTheme();
     updateMode();
     window.scrollTo({ top: 0, behavior: "instant" });
     sizeReader();
@@ -1077,7 +1086,7 @@
       if (event.isTrusted && nativeToggle?.contains(event.target)) {
         event.preventDefault();
         event.stopImmediatePropagation();
-        openSidebar("all", $('.sidebar-nav [data-value="all"]'));
+        openSidebar($('[data-action="sidebar"]'));
         return;
       }
       if (event.composedPath().includes(host) || (nativeToggle?.contains(event.target) && !event.isTrusted)) return;
