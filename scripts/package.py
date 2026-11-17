@@ -20,6 +20,7 @@ assets = (
     "bridge.js",
     "forum.js",
     "reading.js",
+    "scrolling.js",
     "reader.js",
     "reader.css",
     "launcher.css",

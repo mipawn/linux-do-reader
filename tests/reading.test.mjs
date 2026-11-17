@@ -10,14 +10,15 @@ function fixture(sendOverride) {
   const context = vm.createContext({ performance: { now: () => clock }, URLSearchParams });
   let clock = 0;
   vm.runInContext(source("reading.js"), context);
-  const batches = [], visits = [], seen = [];
+  const batches = [], visits = [], seen = [], reports = [];
   const tracker = new context.LDReading.Tracker({
     now: () => clock,
     send: async batch => { batches.push(plain(batch)); if (sendOverride) await sendOverride(batch); },
     visit: async id => { visits.push(id); },
-    acknowledge: (id, floors) => seen.push([id, [...floors]])
+    acknowledge: (id, floors) => seen.push([id, [...floors]]),
+    report: status => reports.push(plain(status))
   });
-  return { context, tracker, batches, visits, seen,
+  return { context, tracker, batches, visits, seen, reports,
     tick: (floors, active = true, ms = 1000) => {
       tracker.sample(floors, active); // establish visibility at the interval start
       clock += ms; tracker.sample(floors, active);
@@ -200,7 +201,8 @@ test("MAIN bridge only accepts numeric positive identifiers and updates native s
 
 test("manifest and package include isolated tracker and MAIN bridge", () => {
   const manifest = JSON.parse(source("manifest.json"));
-  assert.deepEqual(manifest.content_scripts[0].js, ["forum.js", "reading.js", "reader.js"]);
+  assert.deepEqual(manifest.content_scripts[0].js, ["forum.js", "reading.js", "scrolling.js", "reader.js"]);
+  assert.ok(source("scripts/package.py").includes('"scrolling.js"'));
   assert.equal(manifest.content_scripts[1].world, "MAIN");
   assert.deepEqual(manifest.content_scripts[1].js, ["bridge.js"]);
   assert.ok(source("scripts/package.py").includes('"reading.js"'));
@@ -210,4 +212,54 @@ test("manifest and package include isolated tracker and MAIN bridge", () => {
   }
   assert.match(source("LICENSE"), /Apache License[\s\S]*Version 2\.0/);
   assert.match(source("NOTICE"), /Copyright 2026 Mipawn/);
+});
+
+test("confirmed reading clears new-topic state without inventing unread replies", () => {
+  const { markRead } = fixture().context.LDReading;
+  const topic = { unseen: true, last_read_post_number: null, unread_posts: 0, highest_post_number: 100 };
+  assert.equal(markRead(topic, 1), true);
+  assert.deepEqual(topic, { unseen: false, last_read_post_number: 1, unread_posts: 0, highest_post_number: 100 });
+  assert.equal(markRead(topic, 1), false, "repeated acknowledgement must not repaint the entire list");
+  const tracked = { unseen: false, last_read_post_number: 5, unread_posts: 3 };
+  assert.equal(markRead(tracked, 6), true);
+  assert.equal(tracked.unread_posts, 2);
+  assert.equal(markRead(tracked, 4), false);
+  assert.equal(tracked.last_read_post_number, 6);
+  assert.equal(tracked.unread_posts, 2);
+  assert.equal(markRead(tracked, -1), false);
+});
+
+test("reading UI removes the dot instead of fading it and uses in-reader buttons", () => {
+  const reader = source("reader.js");
+  assert.match(reader, /const summary = button\("", "topic"/);
+  assert.match(reader, /const marker = topic\.unseen \? element\("span", "unseen-dot"\) : null/);
+  assert.ok(reader.includes('"置顶，不表示未读"'));
+  assert.doesNotMatch(source("reader.css"), /unseen-dot\.faint|pinned-dot/);
+  assert.match(source("reader.css"), /\.branch-dot \{[^}]*background: var\(--border-strong\)/);
+  assert.match(source("reader.css"), /\.reading-sync\.error \{ flex: 0 1 auto;/);
+  assert.ok(reader.includes("${state.listGeneration}:${state.view}"));
+  assert.doesNotMatch(reader, /Keep native Cmd\/Ctrl-click/);
+  assert.ok(reader.includes('viewport: $("#list-scroll")'));
+  assert.ok(reader.includes('viewport: $("#read-scroll")'));
+});
+
+test("sync status reports failure and later acceptance without optimistic read state", async () => {
+  let failing = true;
+  const f = fixture(async () => { if (failing) throw new Error("offline"); });
+  f.tracker.start(123); f.tick([1]); await settle();
+  assert.deepEqual(f.reports.map(status => status.phase), ["sending", "failed"]);
+  assert.equal(f.seen.length, 0);
+  failing = false; f.advance(30000); await f.tracker.flush();
+  assert.deepEqual(f.reports.map(status => status.phase), ["sending", "failed", "sending", "synced"]);
+  assert.deepEqual(f.reports.at(-1), { topicId: 123, phase: "synced", floors: [1] });
+  assert.deepEqual(f.seen, [[123, [1]]]);
+});
+
+test("a broken sync-status observer never retries an accepted batch", async () => {
+  const f = fixture();
+  f.tracker.report = () => { throw new Error("UI unavailable"); };
+  f.tracker.start(123); f.tick([1]); await settle(); await f.tracker.flush();
+  assert.equal(f.batches.length, 1);
+  assert.deepEqual(f.seen, [[123, [1]]]);
+  assert.equal(f.tracker.current.topicTime, 0);
 });

@@ -15,35 +15,52 @@
   const themes = new Map([["site", "跟随 Linux.do"], ["light", "浅色"], ["dark", "深色"]]);
   const number = new Intl.NumberFormat("zh-CN", { notation: "compact" });
   const state = {
-    view: "latest", category: null, tag: null, query: "", initialFeedPath: null, next: null, rows: [], categories: new Map(), tags: new Map(),
+    view: "latest", category: null, tag: null, query: "", initialFeedPath: null, next: null, listGeneration: 0, rows: [], categories: new Map(), tags: new Map(),
     user: undefined, selected: null, detail: null, openMenu: null, sidebarMenu: null, onScreen: false
   };
   const outletClass = "ld-reader-active";
-  let host, root, listRequest, topicRequest, outlet, modeSwitch, nativeHeader, headerObserver;
+  let host, root, listRequest, topicRequest, outlet, modeSwitch, nativeHeader, headerObserver, listPager, replyPager;
   let pendingOpen = false, readerMode = true, originalLocation, originalPosition, contextLoaded = false;
   let lastActivity = performance.now(), accountRequest, accountRetryAt = 0;
   const readProgress = new Map();
   const tracker = new reading.Tracker({
     send: batch => state.user ? forum.recordReading(batch) : Promise.resolve(),
     visit: id => forum.visitTopic(id),
-    acknowledge: acknowledgeReading
+    acknowledge: acknowledgeReading,
+    report: reportReading
   });
   let headerLogo;
   const $ = (selector) => root.querySelector(selector);
 
   function acknowledgeReading(topicId, floors) {
     if (!state.user || !floors.length) return;
-    const lastRead = Math.max(readProgress.get(topicId) || 0, ...floors);
+    const previous = readProgress.get(topicId) || 0;
+    const lastRead = Math.max(previous, ...floors);
     readProgress.set(topicId, lastRead);
+    let changed = false;
     for (const topic of state.rows.filter(row => row.id === topicId)) {
-      topic.unseen = false;
-      topic.last_read_post_number = Math.max(topic.last_read_post_number || 0, lastRead);
-      topic.unread_posts = Math.max(0, (topic.highest_post_number || topic.posts_count || 0) - topic.last_read_post_number);
+      changed = reading.markRead(topic, lastRead) || changed;
     }
-    if (root && state.onScreen) renderList();
-    document.dispatchEvent(new CustomEvent("linux-do-reader:read", {
+    if (changed && root && state.onScreen) renderList();
+    if (lastRead > previous) document.dispatchEvent(new CustomEvent("linux-do-reader:read", {
       detail: JSON.stringify({ topicId, lastRead })
     }));
+  }
+
+  function reportReading({ topicId, phase, floors }) {
+    if (!state.user || state.detail?.data.id !== topicId) return;
+    state.detail.sync = { phase, floors };
+    updateReadingStatus();
+  }
+
+  function updateReadingStatus() {
+    const node = root && $("#reading-sync");
+    if (!node) return;
+    const sync = state.detail?.sync;
+    node.textContent = !state.user ? "登录后同步阅读" : sync?.phase === "failed" ? "阅读同步失败，将重试" :
+      sync?.phase === "sending" ? "正在同步阅读…" : sync?.phase === "synced" ? `已同步阅读 #${Math.max(...sync.floors)}` : "等待实际阅读…";
+    node.title = "这里显示实际可见楼层的同步结果，不是个人已读帖子总数；原站个人摘要有服务端缓存，重复阅读同一楼层不会再次增加已读帖子数。";
+    node.classList.toggle("error", sync?.phase === "failed");
   }
 
   function sampleReading() {
@@ -227,6 +244,12 @@
     );
     root.addEventListener("click", clicked);
     root.addEventListener("keydown", keydown);
+    listPager = new globalThis.LDScroll.Pager({
+      viewport: $("#list-scroll"),
+      canLoad: () => state.onScreen && !state.listBusy && !state.listError && !!state.next,
+      getKey: () => `${state.listGeneration}:${state.view}:${state.category?.id || ""}:${state.tag?.slug || ""}:${state.query}:${state.initialFeedPath || ""}:${state.next}`,
+      load: () => loadList(true)
+    });
     root.addEventListener("submit", event => {
       if (event.target.id !== "search-form") return;
       event.preventDefault();
@@ -260,15 +283,13 @@
   function topicRow(topic) {
     const selected = state.selected?.id === topic.id;
     const row = element("article", "topic-row" + (selected ? " selected" : ""));
-    const summary = anchor("", forum.topicPath(topic), "topic-select");
-    summary.removeAttribute("target");
-    summary.dataset.action = "topic";
-    summary.dataset.value = topic.id;
+    const summary = button("", "topic", { className: "topic-select", value: topic.id });
     summary.setAttribute("aria-current", selected ? "true" : "false");
-    const marker = element("span", topic.pinned || topic.pinned_globally ? "pinned-dot" : "unseen-dot");
-    if (topic.pinned || topic.pinned_globally) marker.title = "置顶";
-    else if (!topic.unseen) marker.classList.add("faint");
-    const title = add(element("span", "row-title"), marker, element("span", "", topic.title));
+    const marker = topic.unseen ? element("span", "unseen-dot") : null;
+    if (marker) marker.title = "未读话题";
+    const pin = topic.pinned || topic.pinned_globally ? element("span", "row-pin", "置顶") : null;
+    if (pin) pin.title = "置顶，不表示未读";
+    const title = add(element("span", "row-title"), marker, pin, element("span", "", topic.title));
     const chips = add(element("span", "chips"), categoryPill(state.categories.get(topic.category_id), false),
       ...(topic.tags || []).slice(0, 3).map(tag => tagPill(tag, false)));
     const author = topic.author;
@@ -307,14 +328,19 @@
         state.view === "following" ? "你关注或跟踪的话题会显示在这里。" :
         state.view === "bookmarks" ? "收藏的话题会显示在这里。" : "这个列表暂时没有话题。";
       footer.append(status(message));
-    } else if (state.next) footer.append(button("加载更多话题", "more-topics", { className: "secondary-button", symbol: "down" }));
+    } else if (state.next) footer.append(add(element("span", "", "滚动到底部自动加载"), button("手动加载更多", "more-topics", { className: "secondary-button", symbol: "down" })));
     scroll.scrollTop = position;
     if (focusedTopic) $(`.topic-select[data-value="${focusedTopic}"]`)?.focus({ preventScroll: true });
     updateSteps();
+    listPager?.check();
   }
 
   async function loadList(append = false, keepTopic = false) {
     if (append && (!state.next || state.listBusy)) return;
+    if (!append) {
+      state.listGeneration++;
+      listPager?.reset();
+    }
     listRequest?.abort();
     const controller = new AbortController();
     listRequest = controller;
@@ -335,11 +361,7 @@
       const unique = new Map((append ? state.rows : []).map(row => [row.id, row]));
       for (const row of data.rows) {
         const lastRead = readProgress.get(row.id);
-        if (lastRead) {
-          row.unseen = false;
-          row.last_read_post_number = Math.max(row.last_read_post_number || 0, lastRead);
-          row.unread_posts = Math.max(0, (row.highest_post_number || row.posts_count || 0) - row.last_read_post_number);
-        }
+        if (lastRead) reading.markRead(row, lastRead);
         unique.set(row.id, row);
       }
       state.rows = [...unique.values()];
@@ -369,6 +391,7 @@
     topicRequest?.abort();
     state.selected = null;
     state.detail = null;
+    resetReplyPager(null);
     $(".shell").dataset.reading = "false";
     renderReading();
   }
@@ -395,6 +418,7 @@
     topicRequest = controller;
     state.selected = topic;
     state.detail = null;
+    resetReplyPager(null);
     state.topicError = null;
     renderList();
     $("#read-scroll").scrollTop = 0;
@@ -409,6 +433,7 @@
       state.detail = { data, stream, posts, attempted: new Set(posts.keys()), collapsed: new Set(), controller,
         pendingFloor: initialFloor || null, moreBusy: false };
       tracker.start(data.id);
+      resetReplyPager(state.detail);
       rememberTags(data.tags);
       renderReading();
       if (initialFloor && initialFloor > 1) focusPost(initialFloor, false);
@@ -454,6 +479,12 @@
       return;
     }
 
+    const syncStatus = element("span", "reading-sync");
+    syncStatus.id = "reading-sync";
+    syncStatus.setAttribute("role", "status");
+    syncStatus.setAttribute("aria-live", "polite");
+    toolbar.prepend(syncStatus);
+    updateReadingStatus();
     const { data, posts } = detail;
     const bookmark = topicBookmark(data);
     const readingBookmark = button(bookmark ? "取消主题收藏" : "收藏主题", "bookmark", {
@@ -495,6 +526,14 @@
     const section = $("#reply-section");
     if (!detail || !section) return;
     const { posts, data, collapsed, attempted, stream } = detail;
+    const viewport = $("#read-scroll");
+    const bounds = viewport.getBoundingClientRect();
+    const visible = [...section.querySelectorAll(".reply-card")].find(node => {
+      const rect = node.getBoundingClientRect();
+      return rect.bottom > bounds.top && rect.top < bounds.bottom;
+    });
+    const anchorFloor = visible?.dataset.postNumber;
+    const anchorTop = visible?.getBoundingClientRect().top;
     const byNumber = new Map([...posts.values()].map(post => [post.post_number, post]));
     const total = Math.max(0, data.posts_count - 1);
     const loaded = [...posts.values()].filter(post => post.post_number > 1).length;
@@ -554,13 +593,31 @@
     const pending = stream.some(id => !attempted.has(id));
     if (pending || detail.moreError) {
       const footer = add(element("div", "reply-footer"), element("span", "", `已载入 ${loaded} / ${Math.max(total, loaded)} 条回复`));
-      const more = button(detail.moreBusy ? "正在加载…" : detail.moreError ? "重试" : "加载更多回复",
+      if (pending && !detail.moreError) footer.append(element("span", "", "滚动到底部自动加载"));
+      const more = button(detail.moreBusy ? "正在加载…" : detail.moreError ? "重试" : "手动加载更多",
         "more-posts", { className: "secondary-button", symbol: "down" });
       more.disabled = !!detail.moreBusy;
       footer.append(more);
       if (detail.moreError) footer.append(element("span", "error", detail.moreError));
       section.append(footer);
     }
+    if (anchorFloor) {
+      const replacement = section.querySelector(`[data-post-number="${anchorFloor}"]`);
+      if (replacement) viewport.scrollTop += replacement.getBoundingClientRect().top - anchorTop;
+    }
+    replyPager?.check();
+  }
+
+  function resetReplyPager(detail) {
+    replyPager?.destroy();
+    replyPager = null;
+    if (!detail) return;
+    replyPager = new globalThis.LDScroll.Pager({
+      viewport: $("#read-scroll"),
+      canLoad: () => state.onScreen && state.detail === detail && !detail.moreBusy && !detail.moreError && detail.stream.some(id => !detail.attempted.has(id)),
+      getKey: () => `${detail.data.id}:${detail.stream.find(id => !detail.attempted.has(id))}`,
+      load: loadReplies
+    });
   }
 
   async function loadReplies() {
@@ -894,9 +951,6 @@
         $(".topic-row.selected .topic-select")?.focus({ preventScroll: true });
         break;
       case "topic": {
-        // Keep native Cmd/Ctrl-click, Shift-click and middle-click semantics.
-        if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey || event.button > 0) return;
-        event.preventDefault();
         const row = state.rows.find(topic => topic.id === Number(value));
         if (row) selectTopic(row);
         if (host.clientWidth <= 760) $(".mobile-back").focus({ preventScroll: true });
@@ -955,6 +1009,7 @@
     if (performance.now() < accountRetryAt) return Promise.resolve();
     accountRequest = forum.account().then(user => {
       state.user = user;
+      updateReadingStatus();
       if (user) void forum.prepareCSRF().catch(() => {});
     }).catch(error => {
       accountRetryAt = performance.now() + 30000;
@@ -1116,6 +1171,8 @@
         loadList(false, true);
       } else loadList();
     }
+    listPager?.check();
+    replyPager?.check();
   }
 
   function applyNativeNavigation() {

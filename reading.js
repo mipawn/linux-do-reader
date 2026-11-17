@@ -36,9 +36,24 @@
     }).map(node => Number(node.dataset.postNumber));
   }
 
+  // Keep the server's unread-reply distinction: reading an untracked new topic
+  // must not invent a badge for every remaining floor. Only advance known state.
+  function markRead(topic, lastRead) {
+    if (!Number.isSafeInteger(lastRead) || lastRead <= 0) return false;
+    const previous = topic.last_read_post_number || 0;
+    const next = Math.max(previous, lastRead);
+    const changed = topic.unseen !== false || next !== previous;
+    topic.unseen = false;
+    topic.last_read_post_number = next;
+    if (typeof topic.unread_posts === "number") {
+      topic.unread_posts = Math.max(0, topic.unread_posts - (next - previous));
+    }
+    return changed;
+  }
+
   class Tracker {
-    constructor({ send, visit, acknowledge, now = () => performance.now() }) {
-      Object.assign(this, { send, visit, acknowledge, now });
+    constructor({ send, visit, acknowledge, report = () => {}, now = () => performance.now() }) {
+      Object.assign(this, { send, visit, acknowledge, report, now });
       this.sessions = new Set();
       this.current = null;
       this.lastTick = now();
@@ -94,6 +109,11 @@
       if (previous) void this.flush();
     }
 
+    notify(status) {
+      // A UI observer must never turn an accepted request into a retry.
+      try { this.report(status); } catch {}
+    }
+
     async flush({ force = false } = {}) {
       await Promise.all([...this.sessions].map(async session => {
         if (session.sending.size && !force || session.retryAt > this.now() && !force) return;
@@ -110,12 +130,15 @@
           session.timings[floor] -= sent;
           if (!session.timings[floor]) delete session.timings[floor];
         }
+        const floors = Object.keys(batch.timings).map(Number);
+        this.notify({ topicId: session.topicId, phase: "sending", floors });
         const sending = Promise.resolve().then(() => this.send(batch));
         session.sending.add(sending);
         try {
           await sending;
           session.retryAt = 0;
-          this.acknowledge(session.topicId, Object.keys(batch.timings).map(Number));
+          this.acknowledge(session.topicId, floors);
+          this.notify({ topicId: session.topicId, phase: "synced", floors });
         } catch {
           // Retain all unacknowledged milliseconds. The one-minute server
           // limit applies to each outgoing batch, not to the retry backlog.
@@ -124,6 +147,7 @@
             session.timings[floor] = (session.timings[floor] || 0) + time;
           }
           session.retryAt = this.now() + 30000;
+          this.notify({ topicId: session.topicId, phase: "failed", floors });
         } finally {
           session.sending.delete(sending);
           if (!session.topicTime && this.current !== session && !session.sending.size) this.sessions.delete(session);
@@ -134,5 +158,5 @@
     }
   }
 
-  globalThis.LDReading = { readerRoute, feedRoute, visiblePosts, Tracker };
+  globalThis.LDReading = { readerRoute, feedRoute, visiblePosts, markRead, Tracker };
 })();
