@@ -86,7 +86,8 @@ test("far from bottom does not load until a scroll enters the threshold", async 
 
 test("in-flight loading blocks concurrent loads even when the cursor changes", async () => {
   const f = fixture(), pending = deferred();
-  const page = f.make({ load: state => {
+  const page = f.make({ load: (state, viewport) => {
+    viewport.scrollHeight += 10;
     if (state.key === "next-1") return pending.promise;
     state.enabled = false;
   } });
@@ -100,7 +101,7 @@ test("in-flight loading blocks concurrent loads even when the cursor changes", a
 test("changed cursors fill a short viewport until no next page remains", async () => {
   const f = fixture();
   const page = f.make({ load: (state, viewport) => {
-    viewport.scrollHeight = 200;
+    viewport.scrollHeight += 50;
     state.key = state.key === "next-1" ? "next-2" : "next-3";
     if (state.key === "next-3") state.enabled = false;
   } });
@@ -131,6 +132,7 @@ test("a successful no-progress response never retries the same cursor", async ()
 test("a cursor cycle cannot start an infinite loading loop", async () => {
   const f = fixture(), page = f.make({ load: state => {
     state.key = state.key === "next-1" ? "next-2" : "next-1";
+    page.viewport.scrollHeight += 10;
   } });
   f.frame(); await drain(f);
   assert.deepEqual(page.calls, ["next-1", "next-2"]);
@@ -208,11 +210,13 @@ test("destroy ignores a late successful promise without scheduling another page"
 
 test("two viewport instances load independently and removing one preserves the other", async () => {
   const f = fixture(), pendingA = deferred(), pendingB = deferred();
-  const a = f.make({ key: "a-1", load: state => {
+  const a = f.make({ key: "a-1", load: (state, viewport) => {
+    viewport.scrollHeight += 10;
     if (state.key === "a-1") return pendingA.promise;
     state.enabled = false;
   } });
-  const b = f.make({ key: "b-1", load: state => {
+  const b = f.make({ key: "b-1", load: (state, viewport) => {
+    viewport.scrollHeight += 10;
     if (state.key === "b-1") return pendingB.promise;
     state.enabled = false;
   } });
@@ -275,4 +279,42 @@ test("refresh generation can reuse the next-page cursor after the old request ab
   assert.deepEqual(page.calls, ["generation-0:page-1"]);
   pending.reject(new Error("AbortError")); await drain(f);
   assert.deepEqual(page.calls, ["generation-0:page-1", "generation-1:page-1"]);
+});
+
+
+test("an advancing cursor with no visible height growth cannot fetch a whole folded thread", async () => {
+  const f = fixture(), page = f.make({ load: state => { state.key += "-next"; } });
+  page.viewport.scrollHeight = 200;
+  f.frame(); await drain(f);
+  assert.equal(page.calls.length, 1);
+  for (let i = 0; i < 5; i++) { page.pager.check(); f.window.emit("resize"); f.frame(); await drain(f); }
+  assert.equal(page.calls.length, 1);
+  page.viewport.emit("wheel"); page.viewport.emit("scroll"); f.frame(); await drain(f);
+  assert.equal(page.calls.length, 2, "a later scroll can request another bounded page");
+});
+
+test("a short viewport automatically fills at most two growing pages per scroll burst", async () => {
+  const f = fixture(), page = f.make({ load: (state, viewport) => {
+    state.key += "-next"; viewport.scrollHeight += 10;
+  } });
+  page.viewport.scrollHeight = 200;
+  f.frame(); await drain(f);
+  assert.equal(page.calls.length, 2);
+  page.pager.check(); f.frame(); await drain(f);
+  assert.equal(page.calls.length, 2);
+  page.viewport.emit("wheel"); page.viewport.emit("scroll"); f.frame(); await drain(f);
+  assert.equal(page.calls.length, 4);
+});
+
+
+test("programmatic anchor scroll events do not renew the two-page budget", async () => {
+  const f = fixture(), page = f.make({ load: (state, viewport) => {
+    state.key += "-next"; viewport.scrollHeight += 10;
+    viewport.emit("scroll");
+  } });
+  page.viewport.scrollHeight = 200;
+  f.frame(); await drain(f);
+  assert.equal(page.calls.length, 2);
+  for (let i = 0; i < 5; i++) { page.viewport.emit("scroll"); f.frame(); await drain(f); }
+  assert.equal(page.calls.length, 2);
 });

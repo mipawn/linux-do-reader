@@ -18,8 +18,20 @@
       this.attempted = new Set();
       this.epoch = 0;
       this.destroyed = false;
+      this.paused = false;
+      this.autoPages = 0;
       this.onChange = () => this.check();
+      // scroll events are also emitted by our anchor restoration and DOM
+      // replacement. Only actual input intent may reset the prefetch budget.
+      this.onIntent = () => { this.paused = false; this.autoPages = 0; this.check(); };
+      this.onKey = event => {
+        if (["ArrowDown", "ArrowUp", "PageDown", "PageUp", "End", "Home", " "].includes(event.key)) this.onIntent();
+      };
+      this.onDrag = event => { if (event.buttons) this.onIntent(); };
       viewport.addEventListener("scroll", this.onChange, { passive: true });
+      for (const type of ["wheel", "touchmove", "pointerdown"]) viewport.addEventListener(type, this.onIntent, { passive: true });
+      viewport.addEventListener("keydown", this.onKey);
+      viewport.addEventListener("pointermove", this.onDrag, { passive: true });
       this.window.addEventListener("resize", this.onChange);
       this.document?.addEventListener("visibilitychange", this.onChange);
       this.check();
@@ -50,7 +62,7 @@
     }
 
     run() {
-      if (this.destroyed || this.pending || !this.visible() || !this.canLoad()) return;
+      if (this.destroyed || this.paused || this.pending || !this.visible() || !this.canLoad()) return;
       const remaining = this.viewport.scrollHeight - this.viewport.clientHeight - this.viewport.scrollTop;
       if (!Number.isFinite(remaining) || remaining > this.threshold) return;
       const key = this.getKey();
@@ -58,7 +70,7 @@
       if (key == null || key === "" || typeof key === "object" || typeof key === "function" ||
           typeof key === "number" && !Number.isFinite(key) || this.attempted.has(key)) return;
       this.attempted.add(key);
-      const token = { key, epoch: this.epoch };
+      const token = { key, epoch: this.epoch, height: this.viewport.scrollHeight };
       this.pending = token;
       try {
         // Invoke now: the caller can capture the current topic before it changes.
@@ -81,7 +93,13 @@
       }
       // Failed cursors remain attempted; neither scroll nor resize retries them.
       // A successful changed cursor can fill another page while still near bottom.
-      if (success) this.check();
+      if (success) {
+        this.autoPages++;
+        // Advancing cursors alone do not justify fetching an entire collapsed
+        // thread or pages of duplicates. Require height progress and cap bursts.
+        this.paused = this.viewport.scrollHeight <= token.height || this.autoPages >= 2;
+        if (!this.paused) this.check();
+      }
     }
 
     // Explicit recovery after a failed/no-progress page or a dataset transition.
@@ -90,6 +108,8 @@
       if (this.destroyed) return;
       this.epoch++;
       this.attempted.clear();
+      this.paused = false;
+      this.autoPages = 0;
       if (this.pending) this.attempted.add(this.pending.key);
       this.check();
     }
@@ -101,6 +121,9 @@
       if (this.frame !== null) this.window.cancelAnimationFrame(this.frame);
       this.frame = null;
       this.viewport.removeEventListener("scroll", this.onChange);
+      for (const type of ["wheel", "touchmove", "pointerdown"]) this.viewport.removeEventListener(type, this.onIntent);
+      this.viewport.removeEventListener("keydown", this.onKey);
+      this.viewport.removeEventListener("pointermove", this.onDrag);
       this.window.removeEventListener("resize", this.onChange);
       this.document?.removeEventListener("visibilitychange", this.onChange);
     }

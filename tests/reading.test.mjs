@@ -6,13 +6,13 @@ import vm from "node:vm";
 const source = name => readFileSync(new URL(`../${name}`, import.meta.url), "utf8");
 const plain = value => JSON.parse(JSON.stringify(value));
 const settle = () => new Promise(resolve => setImmediate(resolve));
-function fixture(sendOverride) {
+function fixture(sendOverride, options = {}) {
   const context = vm.createContext({ performance: { now: () => clock }, URLSearchParams });
   let clock = 0;
   vm.runInContext(source("reading.js"), context);
   const batches = [], visits = [], seen = [], reports = [];
   const tracker = new context.LDReading.Tracker({
-    now: () => clock,
+    now: () => clock, interval: 0, ...options,
     send: async batch => { batches.push(plain(batch)); if (sendOverride) await sendOverride(batch); },
     visit: async id => { visits.push(id); },
     acknowledge: (id, floors) => seen.push([id, [...floors]]),
@@ -40,22 +40,24 @@ test("native category, tag and top period routes retain their feed", () => {
   assert.equal(feedRoute("/").path, "/latest.json");
 });
 
-test("pagehide force sends a tail batch while the previous batch is in flight", async () => {
+test("pagehide never opens a second timings lane while the previous batch is in flight", async () => {
   let release;
   const blocked = new Promise(resolve => { release = resolve; });
   const f = fixture(async () => { await blocked; });
-  f.tracker.start(10); f.tick([1]); await settle(); f.tick([1]);
+  f.tracker.start(10); f.tick([1]); void f.tracker.flush(); await settle(); f.tick([1]);
   const flushing = f.tracker.flush({ force: true }); await settle();
-  assert.equal(f.batches.length, 2);
-  assert.deepEqual(f.batches.map(b => b.timings), [{ 1: 1000 }, { 1: 1000 }]);
+  assert.equal(f.batches.length, 1);
+  assert.equal(f.tracker.current.topicTime, 1000);
   release(); await flushing; await settle();
+  await f.tracker.flush();
+  assert.deepEqual(f.batches.map(b => b.timings), [{ 1: 1000 }, { 1: 1000 }]);
 });
 
 test("only real foreground time counts, one visit per reading session", async () => {
   const f = fixture(); f.tracker.start(123);
   f.tick([1, 2], false); f.tick([], true); f.tick([1], true, 15000);
   assert.equal(f.batches.length, 0); assert.equal(f.visits.length, 0);
-  f.tick([1, 1, 2, NaN, -1]); await settle();
+  f.tick([1, 1, 2, NaN, -1]); await f.tracker.flush(); await settle();
   assert.deepEqual(f.batches, [{ topic_id: 123, topic_time: 1000, timings: { 1: 1000, 2: 1000 } }]);
   assert.deepEqual(f.seen, [[123, [1, 2]]]);
   f.tick([1]); await f.tracker.flush();
@@ -64,23 +66,23 @@ test("only real foreground time counts, one visit per reading session", async ()
 
 test("a newly visible post never receives the preceding second retroactively", async () => {
   const f = fixture(); f.tracker.start(10);
-  f.tick([1]); await settle();
+  f.tick([1]); await f.tracker.flush(); await settle();
   f.advance(1000); f.tracker.sample([100], true); await f.tracker.flush();
   assert.equal(f.batches.some(batch => batch.timings[100]), false);
-  f.advance(1000); f.tracker.sample([100], true); await settle();
+  f.advance(1000); f.tracker.sample([100], true); await f.tracker.flush(); await settle();
   assert.equal(f.batches.at(-1).timings[100], 1000);
 });
 
 test("topic switching flushes the OLD topic without mixing milliseconds", async () => {
-  const f = fixture(); f.tracker.start(10); f.tick([1]); await settle();
-  f.tick([1]); f.tracker.start(20); f.tick([3]); await settle(); await f.tracker.flush();
+  const f = fixture(); f.tracker.start(10); f.tick([1]); await f.tracker.flush(); await settle();
+  f.tick([1]); f.tracker.start(20); await settle(); f.tick([3]); await f.tracker.flush();
   assert.deepEqual(f.batches.map(b => [b.topic_id, b.timings]), [[10, { 1: 1000 }], [10, { 1: 1000 }], [20, { 3: 1000 }]]);
 });
 
 test("failed timings keep pending time, do not acknowledge, and back off", async () => {
   let fail = true;
   const f = fixture(async () => { if (fail) throw new Error("HTTP 429"); });
-  f.tracker.start(10); f.tick([1]); await settle();
+  f.tracker.start(10); f.tick([1]); await f.tracker.flush(); await settle();
   assert.deepEqual(f.seen, []);
   f.tick([1]); await f.tracker.flush();
   assert.equal(f.batches.length, 1);
@@ -94,9 +96,10 @@ test("pending time survives a topic switch during an in-flight request", async (
   const blocked = new Promise(resolve => { release = resolve; });
   let first = true;
   const f = fixture(async () => { if (first) { first = false; await blocked; } });
-  f.tracker.start(10); f.tick([1]); await settle();
+  f.tracker.start(10); f.tick([1]); void f.tracker.flush(); await settle();
   f.tick([1]); f.tracker.start(20); f.tick([2]); await settle();
   release(); await settle(); await settle();
+  await f.tracker.flush(); await f.tracker.flush();
   assert.equal(f.batches.filter(b => b.topic_id === 10).length, 2);
   assert.equal(f.batches.filter(b => b.topic_id === 20).length, 1);
 });
@@ -120,7 +123,7 @@ test("force flush retains retired in-flight sessions for failure retry", async (
   const blocked = new Promise((resolve, fail) => { reject = fail; });
   let first = true;
   const f = fixture(async () => { if (first) { first = false; await blocked; } });
-  f.tracker.start(10); f.tick([1]); await settle(); f.tracker.start(20);
+  f.tracker.start(10); f.tick([1]); void f.tracker.flush(); await settle(); f.tracker.start(20);
   await f.tracker.flush({ force: true });
   reject(new Error("offline")); await settle(); f.advance(30000);
   await f.tracker.flush();
@@ -145,7 +148,7 @@ test("visibility uses each post's own rectangle, not its descendant branch", () 
 function forumFixture() {
   const calls = [];
   let failOnce = false;
-  const context = vm.createContext({ URL, URLSearchParams, Intl, fetch: async (url, options) => {
+  const context = vm.createContext({ URL, URLSearchParams, Intl, setTimeout, clearTimeout, AbortController, fetch: async (url, options) => {
     calls.push({ url, options });
     const csrf = url === "/session/csrf.json";
     const status = failOnce && !csrf ? 403 : 200;
@@ -153,6 +156,7 @@ function forumFixture() {
     return { ok: status === 200, status, json: async () => csrf ? { csrf: "test-token" } : {} };
   } });
   vm.runInContext(source("forum.js"), context);
+  context.LDForum.requestQueue.interval = 0;
   return { forum: context.LDForum, calls, fail: () => { failOnce = true; } };
 }
 
@@ -246,7 +250,7 @@ test("reading UI removes the dot instead of fading it and uses in-reader buttons
 test("sync status reports failure and later acceptance without optimistic read state", async () => {
   let failing = true;
   const f = fixture(async () => { if (failing) throw new Error("offline"); });
-  f.tracker.start(123); f.tick([1]); await settle();
+  f.tracker.start(123); f.tick([1]); await f.tracker.flush(); await settle();
   assert.deepEqual(f.reports.map(status => status.phase), ["sending", "failed"]);
   assert.equal(f.seen.length, 0);
   failing = false; f.advance(30000); await f.tracker.flush();
@@ -258,8 +262,100 @@ test("sync status reports failure and later acceptance without optimistic read s
 test("a broken sync-status observer never retries an accepted batch", async () => {
   const f = fixture();
   f.tracker.report = () => { throw new Error("UI unavailable"); };
-  f.tracker.start(123); f.tick([1]); await settle(); await f.tracker.flush();
+  f.tracker.start(123); f.tick([1]); await f.tracker.flush(); await settle(); await f.tracker.flush();
   assert.equal(f.batches.length, 1);
   assert.deepEqual(f.seen, [[123, [1]]]);
   assert.equal(f.tracker.current.topicTime, 0);
+});
+
+
+test("a minute of new floors produces two 30-second batches, never a POST per floor", async () => {
+  const f = fixture(undefined, { interval: 30000 });
+  f.tracker.start(10);
+  for (let floor = 1; floor <= 60; floor++) {
+    f.tick([floor]);
+    assert.equal(f.batches.length, Math.floor((floor - 1) / 30));
+    await f.tracker.flush();
+  }
+  assert.equal(f.batches.length, 2);
+  assert.deepEqual(f.batches.map(batch => batch.topic_time), [30000, 30000]);
+  assert.equal(Object.keys(f.batches[0].timings).length, 30);
+  assert.equal(Object.keys(f.batches[1].timings).length, 30);
+});
+
+test("disabled sync has no tracking session, timing POST, visit, or acknowledgement", async () => {
+  const f = fixture(undefined, { enabled: false });
+  f.tracker.start(10);
+  for (let i = 0; i < 60; i++) { f.tick([i + 1]); await f.tracker.flush({ force: true }); }
+  f.tracker.stop(); await settle();
+  assert.equal(f.tracker.current, null);
+  assert.equal(f.tracker.sessions.size, 0);
+  assert.deepEqual([f.batches.length, f.visits.length, f.seen.length], [0, 0, 0]);
+});
+
+test("disabling drops pending time and ignores a late accepted batch", async () => {
+  let release;
+  const blocked = new Promise(resolve => { release = resolve; });
+  const f = fixture(async () => { await blocked; });
+  f.tracker.start(10); f.tick([1]);
+  const sending = f.tracker.flush();
+  f.tick([2]); f.tracker.setEnabled(false);
+  release(); await sending;
+  await f.tracker.flush({ force: true });
+  assert.equal(f.tracker.sessions.size, 0);
+  assert.equal(f.batches.length, 1);
+  assert.equal(f.seen.length, 0);
+  assert.equal(f.reports.some(report => report.phase === "synced"), false);
+});
+
+test("disabling before a sampled visit microtask prevents view registration too", async () => {
+  const f = fixture(); f.tracker.start(10); f.tick([1]); f.tracker.setEnabled(false);
+  await settle();
+  assert.equal(f.visits.length, 0);
+});
+
+test("force, switches and new floors cannot bypass the server reading backoff", async () => {
+  let failing = true;
+  const f = fixture(async () => {
+    if (failing) throw Object.assign(new Error("busy"), { status: 429, retryAfter: 120000 });
+  });
+  f.tracker.start(10); f.tick([1]); await f.tracker.flush();
+  f.tick([2]); await f.tracker.flush({ force: true });
+  f.tracker.start(20); f.tick([1]); await f.tracker.flush({ force: true });
+  assert.equal(f.batches.length, 1);
+  assert.equal(f.reports.at(-1).phase, "paused");
+  assert.equal(f.seen.length, 0);
+  failing = false; f.advance(120000); await f.tracker.flush();
+  assert.equal(f.batches.length, 2);
+  assert.equal(f.batches[1].topic_id, 10);
+  assert.deepEqual(f.batches[1].timings, { 1: 1000, 2: 1000 });
+});
+
+test("reopening a failed topic reuses its pending session instead of duplicating writes", async () => {
+  const f = fixture(async () => { throw new Error("offline"); });
+  f.tracker.start(10); f.tick([1]); await f.tracker.flush();
+  const original = f.tracker.current;
+  f.tracker.start(20); f.tick([1]); f.tracker.start(10);
+  assert.equal(f.tracker.current, original);
+  assert.equal([...f.tracker.sessions].filter(session => session.topicId === 10).length, 1);
+});
+
+test("force lifecycle flush also respects the normal 30-second cadence", async () => {
+  const f = fixture(undefined, { interval: 30000 });
+  f.tracker.start(10); f.tick([1]); await f.tracker.flush({ force: true });
+  assert.equal(f.batches.length, 0);
+  f.advance(29000); await f.tracker.flush();
+  f.tick([2]); await f.tracker.flush({ force: true });
+  assert.equal(f.batches.length, 1);
+});
+
+
+test("sync control is reachable before the first topic is selected", () => {
+  const reader = source("reader.js");
+  const start = reader.indexOf("function renderReading");
+  const end = reader.indexOf("function renderReplies");
+  const body = reader.slice(start, end);
+  assert.ok(start >= 0 && end > start);
+  assert.ok(body.indexOf('const syncStatus = button("", "reading-sync"') < body.indexOf('if (!state.selected)'));
+  assert.match(source("reader.css"), /reading-sync\[aria-pressed="true"\]/);
 });

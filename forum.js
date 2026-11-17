@@ -31,34 +31,166 @@
     return url.pathname + url.search;
   }
 
-  async function request(path, { signal, method = "GET", body, csrf, keepalive = false, headers: extraHeaders } = {}) {
+  // Every reader request shares one lane. Separate panes must not compete with
+  // timings (or a fast scroll) for the same site's request quota.
+  class RequestQueue {
+    constructor({ now = () => Date.now(), wait = ms => new Promise(resolve => setTimeout(resolve, ms)), interval = 1100, timeout = 15000, storage } = {}) {
+      Object.assign(this, { now, wait, interval, timeout });
+      try { this.storage = storage === undefined ? globalThis.localStorage : storage; } catch {}
+      this.pending = [];
+      this.running = false;
+      this.lastStart = -Infinity;
+      this.retryAt = 0;
+    }
+
+    cooldown() {
+      try { this.retryAt = Math.max(this.retryAt, Number(this.storage?.getItem("linux-do-reader-retry-at")) || 0); } catch {}
+      return Math.max(0, this.retryAt - this.now());
+    }
+
+    defer(ms) {
+      this.cooldown();
+      this.retryAt = Math.max(this.retryAt, this.now() + ms);
+      // Share only a deadline, never account/content data, with other tabs.
+      try { this.storage?.setItem("linux-do-reader-retry-at", String(this.retryAt)); } catch {}
+    }
+
+    busyError() {
+      const error = new Error(`原站限流，已暂停请求，请 ${Math.ceil(this.cooldown() / 1000)} 秒后重试。`);
+      Object.assign(error, { status: 429, retryAfter: this.cooldown() });
+      return error;
+    }
+
+    schedule(task, { signal, priority = 0, background = false } = {}) {
+      if (signal?.aborted) return Promise.reject(signal.reason || new DOMException("Aborted", "AbortError"));
+      if (background && this.cooldown()) return Promise.reject(this.busyError());
+      return new Promise((resolve, reject) => {
+        const entry = { task, signal, priority, background, resolve, reject };
+        entry.abort = () => {
+          const index = this.pending.indexOf(entry);
+          if (index < 0) return;
+          this.pending.splice(index, 1);
+          reject(signal.reason || new DOMException("Aborted", "AbortError"));
+        };
+        signal?.addEventListener("abort", entry.abort, { once: true });
+        this.pending.push(entry);
+        void this.drain();
+      });
+    }
+
+    async drain() {
+      if (this.running) return;
+      this.running = true;
+      try {
+        while (this.pending.length) {
+          const cooldown = this.cooldown();
+          if (cooldown) {
+            for (const entry of [...this.pending]) {
+              if (!entry.background) continue;
+              this.pending.splice(this.pending.indexOf(entry), 1);
+              entry.signal?.removeEventListener("abort", entry.abort);
+              entry.reject(this.busyError());
+            }
+          }
+          if (!this.pending.length) break;
+          const delay = Math.max(cooldown, this.lastStart + this.interval - this.now());
+          if (delay > 0) { await this.wait(delay); continue; }
+          // Pick AFTER waiting so newly clicked content overtakes background work.
+          this.pending.sort((a, b) => a.priority - b.priority);
+          const entry = this.pending.shift();
+          entry.signal?.removeEventListener("abort", entry.abort);
+          this.lastStart = this.now();
+          try { entry.resolve(await entry.task()); }
+          catch (error) { entry.reject(error); }
+        }
+      } finally {
+        this.running = false;
+      }
+    }
+  }
+
+  const requestQueue = new RequestQueue();
+
+  function retryDelay(response, payload) {
+    const header = response.headers?.get("Retry-After");
+    const seconds = header?.trim() && Number(header);
+    const date = header && Date.parse(header);
+    const headerDelay = Number.isFinite(seconds) ? seconds * 1000 : Number.isFinite(date) ? date - Date.now() : 0;
+    const payloadDelay = Number(payload?.extras?.wait_seconds ?? payload?.wait_seconds) * 1000;
+    return Math.max(30000, headerDelay || 0, payloadDelay || 0);
+  }
+
+  async function request(path, { signal, method = "GET", body, csrf, keepalive = false, headers: extraHeaders, priority = 0, background = false } = {}) {
     const url = safeURL(path);
     if (url?.origin !== siteURL) throw new Error("原站返回了无效的地址。");
     const headers = { Accept: "application/json", "X-Requested-With": "XMLHttpRequest", ...extraHeaders };
     if (csrf) headers["X-CSRF-Token"] = csrf;
     if (body) headers["Content-Type"] = "application/json";
-    const response = await fetch(url.pathname + url.search, {
-      signal, method, headers, body: body && JSON.stringify(body), keepalive,
-      credentials: "same-origin", mode: "same-origin"
-    });
-    if (response.ok && response.status === 204) return {};
-    const payload = await response.json().catch(() => null);
-    if (response.ok && (payload || method !== "GET")) return payload || {};
-    const messages = {
-      401: "请先登录 Linux.do。",
-      403: "当前账号无法访问此内容，可能需要登录或获得权限。",
-      404: "原站找不到此内容，或当前账号无法访问。",
-      429: "请求过于频繁，请稍后重试。"
+    const perform = async () => {
+      const controller = new AbortController();
+      const abort = () => controller.abort(signal.reason);
+      signal?.addEventListener("abort", abort, { once: true });
+      if (signal?.aborted) abort();
+      let timer;
+      const deadline = new Promise((resolve, reject) => {
+        timer = setTimeout(() => {
+          const error = new Error("原站响应超时，请重试。");
+          error.name = "TimeoutError";
+          controller.abort(error);
+          reject(error);
+        }, requestQueue.timeout);
+      });
+      try {
+        return await Promise.race([deadline, (async () => {
+      const response = await fetch(url.pathname + url.search, {
+        signal: controller.signal, method, headers, body: body && JSON.stringify(body), keepalive,
+        credentials: "same-origin", mode: "same-origin"
+      });
+      if (controller.signal.aborted) throw controller.signal.reason;
+      if (response.ok && response.status === 204) return {};
+      const payload = await response.json().catch(() => null);
+      if (controller.signal.aborted) throw controller.signal.reason;
+      const limited = response.status === 429 || payload?.error_type === "rate_limit";
+      const busy = limited || response.status === 503;
+      const recognized = payload && typeof payload === "object";
+      // A 2xx HTML login/challenge page or damaged JSON must never look like an
+      // accepted write: the reading tracker would otherwise acknowledge time
+      // the server never stored.
+      if (response.ok && !limited && !busy && recognized && !payload?.errors?.length) return payload;
+      const messages = {
+        401: "请先登录 Linux.do。",
+        403: "当前账号无法访问此内容，可能需要登录或获得权限。",
+        404: "原站找不到此内容，或当前账号无法访问。"
+      };
+      const error = new Error(messages[response.status] || payload?.errors?.[0] ||
+        (response.ok ? "原站返回了无法识别的响应，请重试。" : "暂时无法读取 Linux.do，请重试。"));
+      error.status = limited ? 429 : response.status;
+      if (busy) {
+        error.retryAfter = retryDelay(response, payload);
+        requestQueue.defer(error.retryAfter);
+        error.message = requestQueue.busyError().message;
+      }
+      throw error;
+        })()]);
+      } finally {
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", abort);
+      }
     };
-    const error = new Error(messages[response.status] || payload?.errors?.[0] || "暂时无法读取 Linux.do，请重试。");
-    error.status = response.status;
-    throw error;
+    // A content GET may recover once after the shared deadline. Never replay
+    // writes here: only the reading tracker owns unacknowledged timing batches.
+    for (let attempt = 0; ; attempt++) {
+      try { return await requestQueue.schedule(perform, { signal, priority, background }); }
+      catch (error) {
+        if (method !== "GET" || background || ![429, 503].includes(error.status) || attempt >= 1) throw error;
+      }
+    }
   }
 
   let csrfPromise;
-  function prepareCSRF() {
+  function prepareCSRF(options = {}) {
     if (!csrfPromise) {
-      csrfPromise = request("/session/csrf.json", { keepalive: true }).then(({ csrf }) => {
+      csrfPromise = request("/session/csrf.json", { ...options, keepalive: true, priority: options.priority ?? 1 }).then(({ csrf }) => {
         if (!csrf) throw new Error("登录状态已失效，请在原站重新登录。");
         return csrf;
       }).catch(error => { csrfPromise = null; throw error; });
@@ -67,30 +199,32 @@
   }
 
   async function change(path, method, body, options = {}) {
-    const csrf = await prepareCSRF();
+    const csrf = await prepareCSRF(options);
     try {
       return await request(path, { ...options, method, body, csrf });
     } catch (error) {
       if (error.status !== 403) throw error;
       csrfPromise = null;
-      return request(path, { ...options, method, body, csrf: await prepareCSRF() });
+      return request(path, { ...options, method, body, csrf: await prepareCSRF(options) });
     }
   }
 
-  function visitTopic(id) {
+  function visitTopic(id, options = {}) {
     return request(`/t/${Number(id)}.json?track_visit=true`, {
+      ...options, priority: 2, background: true,
       headers: { "Discourse-Track-View": "true", "Discourse-Track-View-Topic-Id": String(id) }
     });
   }
 
-  function recordReading(batch) {
-    // keepalive lets the final small batch survive a refresh or navigation.
-    return change("/topics/timings", "POST", batch, { keepalive: true });
+  function recordReading(batch, options = {}) {
+    // A paused background batch stays with the tracker, not in the content queue.
+    if (requestQueue.cooldown()) return Promise.reject(requestQueue.busyError());
+    return change("/topics/timings", "POST", batch, { ...options, keepalive: true, priority: 2, background: true });
   }
 
   async function account() {
     try {
-      return (await request("/session/current.json")).current_user || null;
+      return (await request("/session/current.json", { priority: 1 })).current_user || null;
     } catch (error) {
       if ([401, 403, 404].includes(error.status)) return null;
       throw error;
@@ -240,7 +374,7 @@
   }
 
   globalThis.LDForum = {
-    siteURL, safeURL, dateLabel, request, change, account, topicPath, tagInfo, categoryPath,
+    siteURL, safeURL, dateLabel, RequestQueue, requestQueue, request, change, account, topicPath, tagInfo, categoryPath,
     prepareCSRF, visitTopic, recordReading,
     feedPath, feed, postsPage, replyTree, sidebar, cooked
   };

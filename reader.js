@@ -23,9 +23,15 @@
   let pendingOpen = false, readerMode = true, originalLocation, originalPosition, contextLoaded = false;
   let lastActivity = performance.now(), accountRequest, accountRetryAt = 0;
   const readProgress = new Map();
+  let readingSyncEnabled = false;
+  try { readingSyncEnabled = localStorage.getItem("linux-do-reader-sync") === "true"; } catch {}
+  let syncController = new AbortController();
   const tracker = new reading.Tracker({
-    send: batch => state.user ? forum.recordReading(batch) : Promise.resolve(),
-    visit: id => forum.visitTopic(id),
+    enabled: readingSyncEnabled,
+    send: batch => state.user && readingSyncEnabled
+      ? forum.recordReading(batch, { signal: syncController.signal })
+      : Promise.reject(new Error("阅读同步已关闭。")),
+    visit: id => forum.visitTopic(id, { signal: syncController.signal }),
     acknowledge: acknowledgeReading,
     report: reportReading
   });
@@ -57,10 +63,26 @@
     const node = root && $("#reading-sync");
     if (!node) return;
     const sync = state.detail?.sync;
-    node.textContent = !state.user ? "登录后同步阅读" : sync?.phase === "failed" ? "阅读同步失败，将重试" :
-      sync?.phase === "sending" ? "正在同步阅读…" : sync?.phase === "synced" ? `已同步阅读 #${Math.max(...sync.floors)}` : "等待实际阅读…";
-    node.title = "这里显示实际可见楼层的同步结果，不是个人已读帖子总数；原站个人摘要有服务端缓存，重复阅读同一楼层不会再次增加已读帖子数。";
-    node.classList.toggle("error", sync?.phase === "failed");
+    node.textContent = !readingSyncEnabled ? "阅读同步：关（点击开启）" : !state.user ? "登录后同步阅读" :
+      sync?.phase === "paused" ? "同步已暂停，优先加载内容" : sync?.phase === "failed" ? "阅读同步失败，稍后重试" :
+      sync?.phase === "sending" ? "正在同步阅读…" : sync?.phase === "synced" ? `已同步阅读 #${Math.max(...sync.floors)}` : "阅读同步：开（30秒批量）";
+    node.title = readingSyncEnabled
+      ? "点击关闭阅读同步。仅按前台可见楼层累计，每30秒合并提交；服务器确认才更新已读标记。限流时暂停同步，优先加载内容。"
+      : "点击开启原站阅读进度同步。当前不发送阅读时间或额外浏览登记，原站已读标记不会由阅读器更新。";
+    node.setAttribute("aria-pressed", String(readingSyncEnabled));
+    node.classList.toggle("error", readingSyncEnabled && sync?.phase === "failed");
+  }
+
+  function toggleReadingSync() {
+    readingSyncEnabled = !readingSyncEnabled;
+    syncController.abort();
+    syncController = new AbortController();
+    tracker.setEnabled(readingSyncEnabled);
+    if (readingSyncEnabled && state.detail) tracker.start(state.detail.data.id);
+    if (state.detail) state.detail.sync = null;
+    try { localStorage.setItem("linux-do-reader-sync", String(readingSyncEnabled)); } catch {}
+    updateReadingStatus();
+    notify(readingSyncEnabled ? "已开启30秒批量阅读同步" : "已关闭阅读同步，未发送的时间已丢弃");
   }
 
   function sampleReading() {
@@ -69,7 +91,7 @@
       const rect = node.getBoundingClientRect();
       return rect.width > 0 && rect.height > 0 && getComputedStyle(node).visibility !== "hidden";
     });
-    const active = state.onScreen && !blocked && state.user !== undefined && !document.hidden && document.hasFocus() &&
+    const active = readingSyncEnabled && state.user && state.onScreen && !blocked && !document.hidden && document.hasFocus() &&
       performance.now() - lastActivity < 180000 && pane?.getBoundingClientRect().width > 0;
     tracker.sample(active ? reading.visiblePosts(root, pane) : [], !!active);
   }
@@ -467,6 +489,14 @@
     toolbar.replaceChildren();
     content.replaceChildren();
     updateSteps();
+    // Keep the sync control reachable even before a topic is selected or while
+    // its first page is loading; otherwise the list-only pane has no way to
+    // discover that synchronization is off.
+    const syncStatus = button("", "reading-sync", { className: "reading-sync" });
+    syncStatus.id = "reading-sync";
+    syncStatus.setAttribute("aria-live", "polite");
+    toolbar.prepend(syncStatus);
+    updateReadingStatus();
     if (!state.selected) {
       content.append(add(element("div", "reading-empty"), icon("list"), element("p", "", "从左侧选择一篇话题")));
       return;
@@ -479,12 +509,6 @@
       return;
     }
 
-    const syncStatus = element("span", "reading-sync");
-    syncStatus.id = "reading-sync";
-    syncStatus.setAttribute("role", "status");
-    syncStatus.setAttribute("aria-live", "polite");
-    toolbar.prepend(syncStatus);
-    updateReadingStatus();
     const { data, posts } = detail;
     const bookmark = topicBookmark(data);
     const readingBookmark = button(bookmark ? "取消主题收藏" : "收藏主题", "bookmark", {
@@ -630,6 +654,7 @@
     renderReplies();
     try {
       const posts = await forum.postsPage(detail.data.id, ids, detail.controller.signal);
+      if (detail.controller.signal.aborted || state.detail !== detail) return;
       for (const id of ids) detail.attempted.add(id);
       for (const post of posts) detail.posts.set(post.id, post);
     } catch (error) {
@@ -966,6 +991,7 @@
       case "more-topics": loadList(true); break;
       case "retry-topic": selectTopic(state.selected); break;
       case "more-posts": loadReplies(); break;
+      case "reading-sync": toggleReadingSync(); break;
       case "bookmark": changeBookmark(); break;
       case "level": closeMenu(true); changeLevel(Number(value)); break;
       case "jump": focusPost(Number(value)); break;
@@ -1010,7 +1036,6 @@
     accountRequest = forum.account().then(user => {
       state.user = user;
       updateReadingStatus();
-      if (user) void forum.prepareCSRF().catch(() => {});
     }).catch(error => {
       accountRetryAt = performance.now() + 30000;
       throw error;
@@ -1021,7 +1046,7 @@
   async function loadContext() {
     const operations = [
       loadAccount(),
-      forum.request("/site.json").then(site => {
+      forum.request("/site.json", { priority: 1 }).then(site => {
         state.categories = new Map((site.categories || []).map(category => [category.id, category]));
         if (state.category) state.category = state.categories.get(state.category.id) || state.category;
         renderFilters();
@@ -1030,7 +1055,7 @@
         renderList();
         if (state.detail) renderReading();
       }),
-      forum.request("/tags.json").then(data => rememberTags(data.tags))
+      forum.request("/tags.json", { priority: 1 }).then(data => rememberTags(data.tags))
     ];
     await Promise.allSettled(operations);
     if (state.openMenu && ["categories", "tags"].includes(state.openMenu.name) && $("#menu input")?.value === "") {
@@ -1251,11 +1276,11 @@
     });
     window.addEventListener("blur", () => { tracker.resetClock(); void tracker.flush(); });
     window.addEventListener("focus", () => { lastActivity = performance.now(); tracker.resetClock(); });
-    window.addEventListener("pagehide", () => { sampleReading(); void tracker.flush({ force: true }); });
+    window.addEventListener("pagehide", () => { sampleReading(); void tracker.flush(); });
     setInterval(sampleReading, 1000);
+    setInterval(() => { if (readingSyncEnabled && state.user) void tracker.flush(); }, 30000);
     setInterval(() => {
-      if (state.user !== undefined) void tracker.flush();
-      else if (state.onScreen) void loadAccount().catch(() => {});
+      if (state.user === undefined && state.onScreen) void loadAccount().catch(() => {});
     }, 10000);
     window.addEventListener("hashchange", () => { if (requestedURL()) openFromURL(); });
   }
