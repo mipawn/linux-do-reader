@@ -2,15 +2,18 @@
 // Copyright 2026 Mipawn
 (() => {
   class Pager {
-    constructor({ viewport, canLoad, getKey, load, threshold = 300 } = {}) {
+    constructor({ viewport, canLoad, getKey, load, getSentinel, onStateChange,
+      threshold = 300, noProgressLimit = 3, now = () => Date.now() } = {}) {
       if (!viewport?.addEventListener || !viewport?.getBoundingClientRect ||
           [canLoad, getKey, load].some(callback => typeof callback !== "function")) {
         throw new TypeError("Pager requires a viewport and canLoad/getKey/load callbacks.");
       }
-      if (!Number.isFinite(threshold) || threshold < 0) {
-        throw new TypeError("Pager threshold must be a nonnegative finite number.");
+      if (!Number.isFinite(threshold) || threshold < 0 || !Number.isSafeInteger(noProgressLimit) || noProgressLimit < 1 ||
+          getSentinel != null && typeof getSentinel !== "function" ||
+          onStateChange != null && typeof onStateChange !== "function" || typeof now !== "function") {
+        throw new TypeError("Pager requires valid callbacks, threshold and noProgressLimit.");
       }
-      Object.assign(this, { viewport, canLoad, getKey, load, threshold });
+      Object.assign(this, { viewport, canLoad, getKey, load, getSentinel, onStateChange, threshold, noProgressLimit, now });
       this.window = viewport.ownerDocument?.defaultView || globalThis.window;
       this.document = viewport.ownerDocument || this.window.document;
       this.frame = null;
@@ -19,31 +22,85 @@
       this.epoch = 0;
       this.destroyed = false;
       this.paused = false;
-      this.autoPages = 0;
+      this.noProgress = 0;
+      this.onlineRetries = 0;
+      this.state = { status: "idle", reason: null, error: null, retryAfter: 0, retryAt: 0 };
+      this.sentinel = null;
+      this.intersecting = false;
       this.onChange = () => this.check();
-      // scroll events are also emitted by our anchor restoration and DOM
-      // replacement. Only actual input intent may reset the prefetch budget.
-      this.onIntent = () => { this.paused = false; this.autoPages = 0; this.check(); };
-      this.onKey = event => {
-        if (["ArrowDown", "ArrowUp", "PageDown", "PageUp", "End", "Home", " "].includes(event.key)) this.onIntent();
+      this.onOnline = () => {
+        // One online transition may recover a transient failure. Repeated online
+        // events cannot become an unbounded error/retry loop.
+        if (this.state.status === "error" && this.state.error?.recoverable &&
+            this.state.retryAt <= this.now() && this.onlineRetries < 1) {
+          this.onlineRetries++;
+          this.recover(false);
+        }
       };
-      this.onDrag = event => { if (event.buttons) this.onIntent(); };
       viewport.addEventListener("scroll", this.onChange, { passive: true });
-      for (const type of ["wheel", "touchmove", "pointerdown"]) viewport.addEventListener(type, this.onIntent, { passive: true });
-      viewport.addEventListener("keydown", this.onKey);
-      viewport.addEventListener("pointermove", this.onDrag, { passive: true });
       this.window.addEventListener("resize", this.onChange);
+      this.window.addEventListener("online", this.onOnline);
       this.document?.addEventListener("visibilitychange", this.onChange);
+      if (getSentinel && this.window.IntersectionObserver) {
+        try {
+          this.observer = new this.window.IntersectionObserver(entries => {
+            for (const entry of entries) {
+              // Ignore notifications queued by an old, replaced DOM node.
+              if (entry.target !== this.sentinel) continue;
+              this.intersecting = entry.isIntersecting;
+              this.check();
+            }
+          }, { root: viewport, rootMargin: `${threshold}px 0px`, threshold: 0 });
+        } catch { /* Unsupported observers fall back to geometry/scroll. */ }
+      }
+      // Re-resolve the callback after DOM replacement even without a scroll.
+      if (getSentinel && this.window.MutationObserver) {
+        try {
+          this.mutations = new this.window.MutationObserver(this.onChange);
+          this.mutations.observe(viewport, { childList: true, subtree: true });
+        } catch { this.mutations?.disconnect(); this.mutations = null; }
+      }
+      if (this.window.ResizeObserver) {
+        try {
+          this.resizes = new this.window.ResizeObserver(this.onChange);
+          this.resizes.observe(viewport);
+        } catch { this.resizes?.disconnect(); this.resizes = null; }
+      }
       this.check();
     }
 
-    // Coalesce scroll, resize and explicit render notifications into one frame.
+    // Coalesce observer, scroll, resize and explicit render notifications.
     check() {
       if (this.destroyed || this.frame !== null) return;
       this.frame = this.window.requestAnimationFrame(() => {
         this.frame = null;
         this.run();
       });
+    }
+
+    setState(status, { reason = null, error = null, retryAt = 0 } = {}) {
+      if (this.state.status === status && this.state.reason === reason &&
+          this.state.error === error && this.state.retryAt === retryAt) return;
+      this.state = { status, reason, error, retryAt, retryAfter: Math.max(0, retryAt - this.now()) };
+      // A rendering callback must not strand the cursor or its single-flight slot.
+      try { this.onStateChange?.(this.state); } catch { /* State remains inspectable. */ }
+    }
+
+    bindSentinel() {
+      let next = this.getSentinel?.() || null;
+      if (next && (next.isConnected === false || this.viewport.contains && !this.viewport.contains(next))) next = null;
+      if (next === this.sentinel) return;
+      if (this.sentinel) {
+        this.observer?.unobserve(this.sentinel);
+        this.resizes?.unobserve(this.sentinel);
+      }
+      this.sentinel = next;
+      this.intersecting = false;
+      if (next) {
+        try { this.observer?.observe(next); }
+        catch { this.observer?.disconnect(); this.observer = null; }
+        try { this.resizes?.observe(next); } catch { /* Geometry remains available. */ }
+      }
     }
 
     visible() {
@@ -55,62 +112,119 @@
       const style = this.window.getComputedStyle?.(viewport);
       if (style && (style.display === "none" || style.visibility === "hidden" ||
           style.visibility === "collapse" || style.contentVisibility === "hidden" || style.opacity === "0")) return false;
-      // A geometrically nonempty container can still be entirely offscreen.
       if (this.window.innerHeight > 0 && (rect.bottom <= 0 || rect.top >= this.window.innerHeight)) return false;
       if (this.window.innerWidth > 0 && (rect.right <= 0 || rect.left >= this.window.innerWidth)) return false;
       return true;
     }
 
-    run() {
-      if (this.destroyed || this.paused || this.pending || !this.visible() || !this.canLoad()) return;
+    nearEnd() {
+      if (this.sentinel?.getBoundingClientRect) {
+        const rect = this.sentinel.getBoundingClientRect(), root = this.viewport.getBoundingClientRect();
+        const near = rect.top <= root.bottom + this.threshold && rect.bottom >= root.top - this.threshold;
+        // Recheck current geometry: an old intersecting=true must not fetch more
+        // after newly appended content moved the sentinel outside the margin.
+        return near && (!this.observer || this.intersecting);
+      }
       const remaining = this.viewport.scrollHeight - this.viewport.clientHeight - this.viewport.scrollTop;
-      if (!Number.isFinite(remaining) || remaining > this.threshold) return;
+      return Number.isFinite(remaining) && remaining <= this.threshold;
+    }
+
+    validKey(key) {
+      return key != null && key !== "" && typeof key !== "object" && typeof key !== "function" &&
+        !(typeof key === "number" && !Number.isFinite(key));
+    }
+
+    run() {
+      if (this.destroyed) return;
+      this.bindSentinel();
+      if (this.pending) return;
       const key = this.getKey();
-      // Keys must be stable primitives, not a fresh object per inspection.
-      if (key == null || key === "" || typeof key === "object" || typeof key === "function" ||
-          typeof key === "number" && !Number.isFinite(key) || this.attempted.has(key)) return;
-      this.attempted.add(key);
+      if (this.state.status === "error") {
+        // An external successful action/dataset change may have advanced a cursor.
+        if (key === this.failedKey) return;
+        this.setState("idle");
+      }
+      if (this.paused) return;
+      if (!this.visible()) { this.setState("hidden"); return; }
+      if (!this.canLoad()) { this.setState("exhausted"); return; }
+      if (!this.validKey(key)) { this.setState("idle", { reason: "invalid-cursor" }); return; }
+      if (!this.nearEnd()) { this.setState("idle"); return; }
+      if (this.attempted.has(key)) {
+        this.paused = true;
+        this.setState("paused", { reason: "duplicate-cursor" });
+        return;
+      }
       const token = { key, epoch: this.epoch, height: this.viewport.scrollHeight };
       this.pending = token;
+      this.setState("loading");
       try {
-        // Invoke now: the caller can capture the current topic before it changes.
+        // Invoke immediately so callers capture their current dataset.
         Promise.resolve(this.load()).then(
-          () => this.finish(token, true),
-          () => this.finish(token, false)
+          result => this.finish(token, true, result),
+          error => this.finish(token, false, error)
         );
-      } catch {
-        this.finish(token, false);
+      } catch (error) {
+        this.finish(token, false, error);
       }
     }
 
-    finish(token, success) {
+    finish(token, success, result) {
       if (this.destroyed || this.pending !== token) return;
       this.pending = null;
-      // A reset/topic transition cannot make an old completion retry its cursor.
       if (token.epoch !== this.epoch) {
+        this.setState("idle");
         this.check();
         return;
       }
-      // Failed cursors remain attempted; neither scroll nor resize retries them.
-      // A successful changed cursor can fill another page while still near bottom.
-      if (success) {
-        this.autoPages++;
-        // Advancing cursors alone do not justify fetching an entire collapsed
-        // thread or pages of duplicates. Require height progress and cap bursts.
-        this.paused = this.viewport.scrollHeight <= token.height || this.autoPages >= 2;
-        if (!this.paused) this.check();
+      if (!success) {
+        // Failures are not successful cursor visits. Keep the error visible and
+        // allow explicit recovery, rather than permanently blacklisting its key.
+        this.failedKey = token.key;
+        const retryAt = Number.isFinite(result?.retryAt) ? result.retryAt
+          : this.now() + (Number.isFinite(result?.retryAfter) ? Math.max(0, result.retryAfter) : 0);
+        this.setState("error", { error: result, reason: "load-failed", retryAt });
+        return;
+      }
+      this.attempted.add(token.key);
+      const grew = Number.isFinite(this.viewport.scrollHeight) && this.viewport.scrollHeight > token.height;
+      this.noProgress = grew && result?.progress !== false ? 0 : this.noProgress + 1;
+      // No two-page cap: healthy pages continue until the sentinel leaves range.
+      // Folded threads and pages of duplicates receive a small, explicit budget.
+      if (this.canLoad() && this.noProgress >= this.noProgressLimit) {
+        this.paused = true;
+        this.setState("paused", { reason: "no-progress" });
+      } else {
+        this.setState(this.canLoad() ? "idle" : "exhausted");
+        this.check();
       }
     }
 
-    // Explicit recovery after a failed/no-progress page or a dataset transition.
-    // An in-flight load still owns its slot and cursor until it settles.
+    recover(manual = true) {
+      if (this.destroyed || this.pending || this.state.retryAt > this.now()) return false;
+      this.attempted.clear();
+      this.paused = false;
+      this.noProgress = 0;
+      this.failedKey = undefined;
+      if (manual) this.onlineRetries = 0;
+      this.setState("idle");
+      this.check();
+      return true;
+    }
+
+    // Manual recovery never bypasses a server's Retry-After deadline.
+    resume() { return this.recover(); }
+
+    // Dataset transition. An old promise continues to own its single-flight slot.
     reset() {
       if (this.destroyed) return;
       this.epoch++;
       this.attempted.clear();
       this.paused = false;
-      this.autoPages = 0;
+      this.noProgress = 0;
+      this.onlineRetries = 0;
+      this.failedKey = undefined;
       if (this.pending) this.attempted.add(this.pending.key);
+      this.setState(this.pending ? "loading" : "idle");
       this.check();
     }
 
@@ -120,12 +234,14 @@
       this.epoch++;
       if (this.frame !== null) this.window.cancelAnimationFrame(this.frame);
       this.frame = null;
+      this.observer?.disconnect();
+      this.mutations?.disconnect();
+      this.resizes?.disconnect();
       this.viewport.removeEventListener("scroll", this.onChange);
-      for (const type of ["wheel", "touchmove", "pointerdown"]) this.viewport.removeEventListener(type, this.onIntent);
-      this.viewport.removeEventListener("keydown", this.onKey);
-      this.viewport.removeEventListener("pointermove", this.onDrag);
       this.window.removeEventListener("resize", this.onChange);
+      this.window.removeEventListener("online", this.onOnline);
       this.document?.removeEventListener("visibilitychange", this.onChange);
+      this.setState("destroyed");
     }
   }
 
