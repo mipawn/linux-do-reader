@@ -1,13 +1,8 @@
 (() => {
-  // List and topic routes are reader-capable. Lists auto-open; topic routes use
-  // the default mode persisted in session state so an explicit "原版" choice
-  // survives native in-app rerenders/navigation until the next full page load.
-  function readerRoute(path) {
-    return !!topicRoute(path) || path === "/" ||
-      /^\/(latest|new|unseen|unread|hot|posted|read|bookmarks)\/?$/.test(path) ||
-      /^\/top(?:\/(all|yearly|quarterly|monthly|weekly|daily))?\/?$/.test(path) ||
-      /^\/c\/(?:[^/]+\/){0,2}\d+(?:\/(latest|top|new|unread))?\/?$/.test(path) ||
-      /^\/tag\/[^/]+(?:\/\d+)?\/?$/.test(path);
+  // Only the homepage may enable the reader. Route parsers below are helpers,
+  // not permission to replace any native list, topic, category, tag or user page.
+  function readerRoute(pathname) {
+    return pathname === "/";
   }
 
   function topicRoute(path) {

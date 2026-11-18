@@ -21,6 +21,8 @@ assets = (
     "navigation.js",
     "discussions.js",
     "scrolling.js",
+    "live.js",
+    "native.js",
     "reader.js",
     "reader.css",
     "launcher.css",

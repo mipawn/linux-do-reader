@@ -238,9 +238,9 @@
     }
   }
 
-  async function account() {
+  async function account(options = {}) {
     try {
-      return (await request("/session/current.json", { priority: 1 })).current_user || null;
+      return (await request("/session/current.json", { priority: 1, ...options })).current_user || null;
     } catch (error) {
       if ([401, 403, 404].includes(error.status)) return null;
       throw error;
@@ -297,10 +297,10 @@
     return { rows, tags: data.tags || [], next: search.more_full_page_results || search.more_posts ? next.pathname + next.search : null };
   }
 
-  async function postsPage(topicId, ids, signal) {
+  async function postsPage(topicId, ids, signal, options = {}) {
     const params = new URLSearchParams();
     for (const id of ids) params.append("post_ids[]", id);
-    const data = await request(`/t/${topicId}/posts.json?${params}`, { signal });
+    const data = await request(`/t/${topicId}/posts.json?${params}`, { ...options, signal });
     if (!Array.isArray(data.post_stream?.posts)) throw new Error("原站未返回有效的回复分页，请重试。");
     return data.post_stream.posts;
   }

@@ -21,7 +21,7 @@
   const outletClass = "ld-reader-active";
   let host, root, listRequest, topicRequest, outlet, modeSwitch, nativeHeader, headerObserver, listPager, replyPager;
   let pendingOpen = false, readerMode = true, originalLocation, originalPosition, contextLoaded = false;
-  let accountRequest, accountRetryAt = 0;
+  let nativeClient, contextRequest;
   let recoveryTimer;
   let headerLogo;
   const $ = (selector) => root.querySelector(selector);
@@ -159,6 +159,7 @@
         </section>
         <section id="reading-pane" class="reading-pane" aria-label="阅读区">
           <div id="reading-toolbar" class="reading-toolbar"><div id="reading-back"></div><div id="reading-actions"></div></div>
+          <div id="live-status" class="live-status" role="status" aria-live="polite" hidden></div>
           <div id="read-scroll" class="read-scroll" tabindex="0" aria-label="话题与回复">
             <div id="reading" class="reading"></div>
           </div>
@@ -306,8 +307,14 @@
   function scheduleRecovery() {
     clearTimeout(recoveryTimer);
     if (!state.onScreen || !((state.listError && state.listRetryAt > Date.now()) ||
-        (state.detail?.moreError && state.detail.retryAt > Date.now()))) return;
-    recoveryTimer = setTimeout(() => { renderListFooter(); if (state.detail?.moreError) renderReplies(); }, 1000);
+        (state.detail?.moreError && state.detail.retryAt > Date.now()) ||
+        (state.detail?.liveStatus?.error && state.detail.liveStatus.retryAt > Date.now()))) return;
+    recoveryTimer = setTimeout(() => {
+      renderListFooter();
+      if (state.detail?.moreError) renderReplies();
+      renderLiveStatus();
+      scheduleRecovery();
+    }, 1000);
   }
 
   function renderList() {
@@ -376,6 +383,7 @@
   }
 
   function clearTopic() {
+    state.detail?.live?.stop();
     topicRequest?.abort();
     state.selected = null;
     state.detail = null;
@@ -398,6 +406,7 @@
     if (activate) openTopicInView();
     closeMenu();
     if (state.selected?.id === topic.id && state.detail) return;
+    state.detail?.live?.stop();
     topicRequest?.abort();
     const controller = new AbortController();
     topicRequest = controller;
@@ -420,11 +429,149 @@
       resetReplyPager(state.detail);
       rememberTags(data.tags);
       renderReading();
+      startTopicLive(state.detail);
       if (initialFloor && initialFloor > 1) focusPost(initialFloor, false);
     } catch (error) {
       if (controller.signal.aborted) return;
       state.topicError = error.message;
       renderReading();
+    }
+  }
+
+  function getNativeClient() {
+    if (!nativeClient) {
+      if (!globalThis.LDLive) throw new Error("请重新加载扩展并刷新首页，以启用原版回复与实时消息。");
+      nativeClient = new globalThis.LDLive.NativeClient();
+    }
+    return nativeClient;
+  }
+
+  function startTopicLive(detail) {
+    if (!state.onScreen || state.detail !== detail) return;
+    try {
+      detail.live = new globalThis.LDLive.TopicSession({
+        client: getNativeClient(), forum, detail,
+        isVisible: () => state.onScreen && state.detail === detail && !document.hidden && navigation.readerRoute(location.pathname),
+        currentUserId: state.user?.id, presenceEnabled: true,
+        onStatus: live => {
+          if (state.detail !== detail) return;
+          detail.liveStatus = live;
+          renderLiveStatus();
+          if (!live.busy) replyPager?.check();
+          scheduleRecovery();
+        },
+        onChange: ({ opChanged }) => {
+          if (state.detail !== detail || !state.onScreen) return;
+          if (opChanged) refreshReadingView();
+          else {
+            const count = stat("comment", "回复", Math.max(0, detail.data.posts_count - 1));
+            if (count) { count.id = "topic-reply-count"; $("#topic-reply-count")?.replaceWith(count); }
+            renderReplies();
+          }
+        }
+      });
+      void detail.live.start();
+    } catch (error) {
+      detail.liveStatus = { phase: "paused", error: error.message, users: [], count: 0 };
+      renderLiveStatus();
+    }
+  }
+
+  function refreshReadingView() {
+    const viewport = $("#read-scroll");
+    const top = viewport.getBoundingClientRect().top;
+    const visible = [...root.querySelectorAll("[data-post-number]")].find(node => node.getBoundingClientRect().bottom > top);
+    const floor = visible?.dataset.postNumber;
+    const offset = visible?.getBoundingClientRect().top;
+    const position = viewport.scrollTop;
+    renderReading();
+    const replacement = floor && $(`[data-post-number="${floor}"]`);
+    if (replacement) viewport.scrollTop += replacement.getBoundingClientRect().top - offset;
+    else viewport.scrollTop = position;
+  }
+
+  function renderLiveStatus() {
+    if (!root) return;
+    const bar = $("#live-status");
+    if (!bar) return;
+    const detail = state.detail;
+    bar.hidden = !detail;
+    bar.replaceChildren();
+    if (!detail) return;
+    const live = detail.liveStatus || { phase: "connecting", users: [], count: 0 };
+    const seconds = Math.max(0, Math.ceil(((live.retryAt || 0) - Date.now()) / 1000));
+    const message = live.error ? (seconds ? `原站限流，实时更新已暂停 · ${seconds} 秒后可重试` : `实时更新已暂停 · ${live.error}`)
+      : live.phase === "connecting" ? "正在连接原版实时消息…"
+      : live.pending ? `等待更新 ${live.pending} 条回复` : live.busy ? "正在同步实时状态…" : "原版消息通道 · 新回复自动更新";
+    bar.append(element("span", live.error ? "live-message error" : "live-message", message));
+    if (live.presenceError) bar.append(element("span", "live-presence muted", live.presenceError));
+    else if (live.presenceUnavailable) bar.append(element("span", "live-presence muted", "原站未提供正在回复状态。"));
+    else if (live.count > 0) {
+      const typing = element("span", "live-presence");
+      for (const user of (live.users || []).slice(0, 5)) typing.append(avatar(user, 20));
+      const names = (live.users || []).slice(0, 3).map(user => user.username).filter(Boolean).join("、");
+      typing.append(element("span", "", names ? `${names}${live.count > 3 ? ` 等 ${live.count} 人` : ""}正在回复…` : `${live.count} 人正在回复…`));
+      bar.append(typing);
+    }
+    const retry = button(live.error ? "重试实时更新" : "更新回复", "refresh-posts", { className: "text-button", symbol: "refresh" });
+    retry.disabled = seconds > 0 || live.busy || live.phase === "connecting";
+    bar.append(retry);
+  }
+
+  function canReply(detail) {
+    if (!state.user) return true; // The native login dialog handles guests.
+    const allowed = detail.data.details?.can_create_post;
+    if (typeof allowed === "boolean") return allowed;
+    if (detail.data.archived) return false;
+    return !detail.data.closed || !!(state.user.staff || state.user.admin || state.user.moderator);
+  }
+
+  function replyButton(detail, post, label = "回复") {
+    const control = button(state.user === null ? "登录后回复" : label, "reply", {
+      className: "reply-button", value: post?.post_number || 0, symbol: "reply"
+    });
+    control.disabled = !!detail.replyBusy || !canReply(detail);
+    control.setAttribute("aria-label", post ? `回复 #${post.post_number}` : "回复主题");
+    if (!canReply(detail)) control.title = "原站当前不允许回复此话题。";
+    return control;
+  }
+
+  async function replyTo(floor) {
+    const detail = state.detail;
+    if (!detail || detail.replyBusy || !canReply(detail) || !state.onScreen || !navigation.readerRoute(location.pathname)) return;
+    const post = floor > 0 ? [...detail.posts.values()].find(value => value.post_number === floor) : null;
+    if (floor > 0 && (!post || globalThis.LDDiscussion.postState(post) !== "available")) return;
+    if (forum.requestQueue.cooldown()) {
+      const error = forum.requestQueue.busyError();
+      detail.live?.pause(error);
+      notify(error.message);
+      return;
+    }
+    detail.replyBusy = true;
+    for (const control of root.querySelectorAll('[data-action="reply"]')) control.disabled = true;
+    try {
+      const { data } = detail;
+      const topic = Object.fromEntries(["id", "title", "fancy_title", "slug", "category_id", "closed", "archived", "archetype", "draft_key", "draft_sequence", "posts_count", "highest_post_number"]
+        .map(key => [key, data[key]]));
+      topic.details = { can_create_post: data.details?.can_create_post };
+      const target = post && Object.fromEntries(["id", "post_number", "topic_id", "username", "display_username", "name", "avatar_template"].map(key => [key, post[key]]));
+      const result = await getNativeClient().reply(topic, target);
+      if (result?.opened === false && !result.login && state.detail === detail) notify("原站编辑器尚未打开，请重试或在原站回复。");
+    } catch (error) {
+      if (error.status === 429 || [502, 503, 504].includes(error.status) && (error.retryAfter != null || error.retryAt != null)) {
+        const delay = Number.isFinite(error.retryAt) ? Math.max(0, error.retryAt - Date.now())
+          : Number.isFinite(error.retryAfter) ? Math.max(0, error.retryAfter) : 5000;
+        forum.requestQueue.defer(delay);
+        if (state.detail === detail) detail.live?.pause(forum.requestQueue.busyError());
+        scheduleRecovery();
+      }
+      if (error.name !== "AbortError" && state.detail === detail && state.onScreen) notify(error.message);
+    } finally {
+      detail.replyBusy = false;
+      if (state.detail === detail && state.onScreen) {
+        for (const control of root.querySelectorAll('[data-action="reply"]')) control.disabled = !canReply(detail);
+        sizeReader();
+      }
     }
   }
 
@@ -464,6 +611,7 @@
     const content = $("#reading");
     toolbar.replaceChildren();
     content.replaceChildren();
+    renderLiveStatus();
     updateSteps();
     if (!state.selected) {
       content.append(add(element("div", "reading-empty"), icon("list"), element("p", "", "从左侧选择一篇话题")));
@@ -485,7 +633,8 @@
     readingBookmark.disabled = !!detail.bookmarkBusy;
     readingBookmark.setAttribute("aria-pressed", String(!!bookmark));
     const level = levels.get(data.details?.notification_level) || "常规";
-    toolbar.prepend(readingBookmark, button(level, "menu", { className: "level-button menu-toggle", symbol: "bell", value: "notification" }));
+    toolbar.prepend(readingBookmark, button(level, "menu", { className: "level-button menu-toggle", symbol: "bell", value: "notification" }),
+      replyButton(detail, null, "回复主题"));
 
     const op = [...posts.values()].find(post => post.post_number === 1);
     const category = state.categories.get(data.category_id);
@@ -495,9 +644,10 @@
     if (breadcrumb.childNodes.length) header.append(breadcrumb);
     header.append(element("h2", "article-title", data.title || selected.title));
     if (op) {
+      const replyCount = stat("comment", "回复", Math.max(0, data.posts_count - 1));
+      if (replyCount) replyCount.id = "topic-reply-count";
       header.append(add(element("div", "article-meta"), replyPerson(op, true), date(op.created_at),
-        stat("comment", "回复", Math.max(0, data.posts_count - 1)),
-        stat("eye", "浏览", data.views), stat("heart", "点赞", data.like_count)));
+        replyCount, stat("eye", "浏览", data.views), stat("heart", "点赞", data.like_count)));
     } else header.append(date(data.created_at));
     const tags = (data.tags || []).slice(0, 12);
     if (tags.length) header.append(add(element("div", "chips article-tags"), ...tags.map(tag => tagPill(tag))));
@@ -592,6 +742,7 @@
         article.append(related);
       }
       article.append(postContent(post));
+      if (postState === "available") article.append(add(element("div", "post-actions"), replyButton(detail, post)));
       if (placeholder) article.append(anchor(`在原站查看 #${floor}`, forum.topicPath(data, floor), "parent-ref", "out"));
       if (!expanded && children.length) article.append(button(`展开 ${children.length} 条直属回复`, "branch", {
         className: "collapsed-children", value: floor, symbol: "down"
@@ -605,7 +756,7 @@
       }
     }
     if (loaded) section.append(tree);
-    const pending = stream.some(id => !attempted.has(id));
+    const pending = pendingPostIds(detail).length > 0;
     const paused = detail.paging?.status === "paused";
     const retrySeconds = Math.max(0, Math.ceil(((detail.retryAt || 0) - Date.now()) / 1000));
     const footer = add(element("div", "reply-footer"), element("span", "", `已载入 ${loaded} / ${Math.max(total, loaded)} 条回复`));
@@ -627,14 +778,18 @@
     replyPager?.check();
   }
 
+  function pendingPostIds(detail) {
+    return detail.stream.filter(id => !detail.attempted.has(id) && !detail.live?.hasPending(id));
+  }
+
   function resetReplyPager(detail) {
     replyPager?.destroy();
     replyPager = null;
     if (!detail) return;
     replyPager = new globalThis.LDScroll.Pager({
       viewport: $("#read-scroll"),
-      canLoad: () => state.onScreen && state.detail === detail && !detail.moreBusy && !detail.moreError && detail.stream.some(id => !detail.attempted.has(id)),
-      getKey: () => `${detail.data.id}:${detail.stream.find(id => !detail.attempted.has(id))}`,
+      canLoad: () => state.onScreen && state.detail === detail && !detail.moreBusy && !detail.live?.busy && !detail.moreError && pendingPostIds(detail).length > 0,
+      getKey: () => `${detail.data.id}:${pendingPostIds(detail)[0]}`,
       getSentinel: () => $("#reply-section .reply-footer"),
       load: loadReplies,
       onStateChange: paging => {
@@ -648,10 +803,11 @@
 
   async function loadReplies() {
     const detail = state.detail;
-    if (!detail || detail.moreBusy || detail.retryAt > Date.now()) return;
+    if (!detail || detail.moreBusy || detail.live?.busy || detail.retryAt > Date.now()) return;
     const previousCount = detail.posts.size;
-    const ids = detail.stream.filter(id => !detail.attempted.has(id)).slice(0, Math.min(detail.data.chunk_size || 20, 30));
+    const ids = pendingPostIds(detail).slice(0, Math.min(detail.data.chunk_size || 20, 30));
     if (!ids.length) return;
+    detail.loadingIds = new Set(ids);
     detail.moreBusy = true;
     detail.moreError = null;
     detail.retryAt = 0;
@@ -660,7 +816,9 @@
       const posts = await forum.postsPage(detail.data.id, ids, detail.controller.signal);
       if (detail.controller.signal.aborted || state.detail !== detail) return;
       for (const id of ids) detail.attempted.add(id);
-      for (const post of posts) detail.posts.set(post.id, post);
+      for (const post of posts) {
+        if (!detail.live?.tombstones.has(post.id)) detail.posts.set(post.id, post);
+      }
       return { progress: detail.posts.size > previousCount };
     } catch (error) {
       if (!detail.controller.signal.aborted && state.detail === detail) {
@@ -670,8 +828,12 @@
       }
       throw error;
     } finally {
+      detail.loadingIds.clear();
       detail.moreBusy = false;
-      if (state.detail === detail) renderReplies();
+      if (state.detail === detail) {
+        renderReplies();
+        detail.live?.kick();
+      }
     }
   }
 
@@ -1004,6 +1166,11 @@
       case "refresh": loadList(false, true).catch(() => {}); break;
       case "more-topics": listPager?.resume(); loadList(true).catch(() => {}); break;
       case "retry-topic": selectTopic(state.selected); break;
+      case "reply": void replyTo(Number(value)); break;
+      case "refresh-posts":
+        if (state.detail?.live) state.detail.live.refresh();
+        else if (state.detail) startTopicLive(state.detail);
+        break;
       case "more-posts": replyPager?.resume(); loadReplies().catch(() => {}); break;
       case "bookmark": changeBookmark(); break;
       case "level": closeMenu(true); changeLevel(Number(value)); break;
@@ -1043,33 +1210,48 @@
     }
   }
 
-  function loadAccount() {
-    if (accountRequest) return accountRequest;
-    if (performance.now() < accountRetryAt) return Promise.resolve();
-    accountRequest = forum.account().then(user => {
-      state.user = user;
-    }).catch(error => {
-      accountRetryAt = performance.now() + 30000;
-      throw error;
-    }).finally(() => { accountRequest = null; });
-    return accountRequest;
-  }
-
   async function loadContext() {
-    const operations = [
-      loadAccount(),
-      forum.request("/site.json", { priority: 1 }).then(site => {
-        state.categories = new Map((site.categories || []).map(category => [category.id, category]));
-        if (state.category) state.category = state.categories.get(state.category.id) || state.category;
-        renderFilters();
-        rememberTags(site.top_tags);
-        rememberTags(site.navigation_menu_site_top_tags);
-        renderList();
-        if (state.detail) renderReading();
-      }),
-      forum.request("/tags.json", { priority: 1 }).then(data => rememberTags(data.tags))
-    ];
-    await Promise.allSettled(operations);
+    contextRequest?.abort();
+    const controller = new AbortController();
+    contextRequest = controller;
+    const render = () => {
+      if (controller.signal.aborted || !state.onScreen) return;
+      renderFilters();
+      renderList();
+      if (state.detail) {
+        if (state.detail.live) state.detail.live.currentUserId = state.user?.id;
+        refreshReadingView();
+      }
+    };
+    try {
+      // Reuse the already-loaded native account/site data: no account poller or
+      // duplicate /site + /tags reads during the usual page initialization.
+      const context = await getNativeClient().context();
+      if (controller.signal.aborted) return;
+      state.nativeContext = context;
+      state.user = context.user || null;
+      state.categories = new Map((context.categories || []).map(category => [category.id, category]));
+      rememberTags(context.tags);
+      render();
+    } catch (error) {
+      if (controller.signal.aborted) return;
+      // A bounded fallback for Discourse versions without a compatible owner;
+      // it is never retried on a timer and is canceled on leaving home.
+      await Promise.allSettled([
+        forum.account({ signal: controller.signal, background: true }).then(user => { if (!controller.signal.aborted) state.user = user; }),
+        forum.request("/site.json", { signal: controller.signal, priority: 1, background: true }).then(site => {
+          if (controller.signal.aborted) return;
+          state.categories = new Map((site.categories || []).map(category => [category.id, category]));
+          rememberTags(site.top_tags);
+          rememberTags(site.navigation_menu_site_top_tags);
+        }),
+        forum.request("/tags.json", { signal: controller.signal, priority: 1, background: true }).then(data => {
+          if (!controller.signal.aborted) rememberTags(data.tags);
+        })
+      ]);
+      render();
+    }
+    if (controller.signal.aborted || !state.onScreen) return;
     if (state.openMenu && ["categories", "tags"].includes(state.openMenu.name) && $("#menu input")?.value === "") {
       populateMenu(state.openMenu.name);
       $("#menu input")?.focus({ preventScroll: true });
@@ -1090,9 +1272,7 @@
     const reader = modeSwitch.querySelector('[data-mode="reader"]');
     reader.setAttribute("aria-pressed", String(state.onScreen));
     original.setAttribute("aria-pressed", String(!state.onScreen));
-    const label = navigation.topicRoute(location.pathname) ? "树状讨论" : "阅读器";
-    if (reader.textContent !== label) reader.textContent = label;
-    modeSwitch.hidden = !navigation.readerRoute(location.pathname) && !navigation.topicRoute(location.pathname);
+    modeSwitch.hidden = !navigation.readerRoute(location.pathname);
   }
 
   function syncDocumentTheme() {
@@ -1123,6 +1303,10 @@
     pendingOpen = false;
     clearTimeout(recoveryTimer);
     listRequest?.abort();
+    contextRequest?.abort();
+    nativeClient?.close();
+    nativeClient = null;
+    if (!state.nativeContext && state.user === undefined) contextLoaded = false;
     state.listBusy = false;
     topicRequest?.abort();
     if (state.detail) state.detail.moreBusy = false;
@@ -1144,12 +1328,29 @@
   function sizeReader() {
     if (!state.onScreen) return;
     const top = Math.max(0, outlet.getBoundingClientRect().top, nativeHeader?.getBoundingClientRect().bottom || 0);
-    const height = Math.max(240, Math.floor(window.innerHeight - top));
+    const composer = document.getElementById("reply-control")?.getBoundingClientRect();
+    const bottom = composer?.height > 0 && composer.bottom > 0 ? Math.min(window.innerHeight, composer.top) : window.innerHeight;
+    const height = Math.max(160, Math.floor(bottom - top));
     host.style.setProperty("--ld-reader-height", height + "px");
     syncSidebar();
   }
 
   function syncNativeLayout() {
+    if (!navigation.readerRoute(location.pathname)) {
+      // Discourse is an SPA: leaving home must also tear down an already-open
+      // reader, not just prevent the next mount. No controls/theme/layout remain.
+      pendingOpen = false;
+      hideReader(false, true);
+      outlet?.classList.remove(outletClass);
+      host?.remove();
+      modeSwitch?.remove();
+      headerObserver?.disconnect();
+      outlet = null;
+      nativeHeader = null;
+      readerMode = true;
+      return;
+    }
+    if (readerMode && !state.onScreen) pendingOpen = true;
     const header = document.querySelector(".d-header");
     const logo = header?.querySelector(".home-logo-wrapper-outlet");
     const position = logo || header?.querySelector(".contents") || header?.querySelector(".d-header-icons") || header;
@@ -1168,20 +1369,21 @@
     outlet = siteOutlet;
     updateMode();
     if (pendingOpen && modeSwitch.isConnected && outlet) showReader();
-    if (state.onScreen) syncHeaderLogo();
+    const composer = document.getElementById("reply-control");
+    if (composer) headerObserver.observe(composer);
+    if (state.onScreen) { syncHeaderLogo(); sizeReader(); }
     syncSidebar();
   }
 
   function showReader() {
-    if (!navigation.readerRoute(location.pathname) && !navigation.topicRoute(location.pathname)) {
-      if (root) notify("阅读器仅用于话题列表和树状讨论，当前页面保持原版。");
-      return;
-    }
+    // Default-deny every non-home route, including explicit URL/action requests.
+    // A topic selected from the home list is rendered in-place, never a /t/ route.
+    if (!navigation.readerRoute(location.pathname)) return false;
     readerMode = true;
-    if (state.onScreen) return;
+    if (state.onScreen) return true;
     if (!outlet?.isConnected || !modeSwitch?.isConnected) {
       pendingOpen = true;
-      return;
+      return true;
     }
     pendingOpen = false;
     if (!host) mount();
@@ -1203,47 +1405,37 @@
       loadContext();
     }
     if (pageChanged || (!state.rows.length && !state.listBusy)) {
-      const topicRoute = navigation.topicRoute(location.pathname);
-      const route = topicRoute ? navigation.feedRoute("/") : navigation.feedRoute(location.pathname, location.search);
-      Object.assign(state, {
-        view: route.view, initialFeedPath: topicRoute ? null : route.path,
-        category: route.categoryId ? state.categories.get(route.categoryId) || { id: route.categoryId, slug: route.categorySlug, name: route.categorySlug } : null,
-        tag: route.tagSlug ? { slug: route.tagSlug, name: route.tagSlug, id: route.tagId } : null,
-        query: ""
-      });
+      const route = navigation.feedRoute("/", location.search);
+      Object.assign(state, { view: route.view, initialFeedPath: route.path, category: null, tag: null, query: "" });
       renderFilters();
-      if (topicRoute) {
-        selectTopic({ id: Number(topicRoute[2]), slug: topicRoute[1] || "topic" }, true, Number(topicRoute[3]));
-        loadList(false, true).catch(() => {});
-      } else loadList().catch(() => {});
-    } else if (navigation.topicRoute(location.pathname) && !state.detail) {
-      const match = navigation.topicRoute(location.pathname);
-      selectTopic({ id: Number(match[2]), slug: match[1] || "topic" }, true, Number(match[3]));
+      loadList().catch(() => {});
     }
     listPager?.reset();
     replyPager?.check();
     renderListFooter();
+    return true;
   }
 
   function applyNativeNavigation() {
     if (state.onScreen && originalLocation === location.pathname + location.search) return;
     if (state.onScreen) hideReader(false, true);
     pendingOpen = readerMode && navigation.readerRoute(location.pathname);
-    if (pendingOpen) syncNativeLayout();
+    syncNativeLayout();
   }
 
   extension?.onMessage?.addListener((message, sender, respond) => {
     if (message.type !== "linux-do-reader:open") return;
-    showReader();
-    respond({ open: true });
+    respond({ open: showReader() });
   });
 
   function requestedURL() {
+    if (!navigation.readerRoute(location.pathname)) return false;
     const url = new URL(location.href);
     return url.searchParams.get("ld-reader") === "1" || url.hash === "#ld-reader";
   }
 
   function openFromURL() {
+    if (!navigation.readerRoute(location.pathname)) return false;
     const url = new URL(location.href);
     url.searchParams.delete("ld-reader");
     if (url.hash === "#ld-reader") url.hash = "";
@@ -1292,14 +1484,9 @@
     });
     if (requestedAtStart || requestedURL()) openFromURL();
     else if (navigation.readerRoute(location.pathname)) showReader();
-    window.addEventListener("pagehide", () => {
-      listRequest?.abort();
-      topicRequest?.abort();
-      clearTimeout(recoveryTimer);
-    });
-    setInterval(() => {
-      if (state.user === undefined && state.onScreen) void loadAccount().catch(() => {});
-    }, 10000);
+    window.addEventListener("pagehide", () => hideReader(false, true));
+    window.addEventListener("pageshow", syncNativeLayout);
+    document.addEventListener("visibilitychange", () => state.detail?.live?.visibilityChanged());
     window.addEventListener("hashchange", () => { if (requestedURL()) openFromURL(); });
   }
 
