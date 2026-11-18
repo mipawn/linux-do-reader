@@ -110,6 +110,50 @@ function topic(f, floor, type, messageId) {
   f.event("topic", { id: 100 + floor, post_number: floor, type }, messageId);
 }
 
+test("default browser timers retain the Window receiver through start, hide, pause, refresh and stop", async () => {
+  const clock = clockFixture(), context = runtime(clock, {
+    hostSetTimer: clock.setTimer, hostClearTimer: clock.clearTimer
+  });
+  // Node timers do not enforce Window's receiver. Emulate the browser's
+  // brand check in this realm instead of letting a permissive VM hide it.
+  vm.runInContext(`
+    globalThis.setTimeout = function (...args) {
+      if (this !== globalThis) throw new TypeError("Illegal invocation");
+      return hostSetTimer(...args);
+    };
+    globalThis.clearTimeout = function (...args) {
+      if (this !== globalThis) throw new TypeError("Illegal invocation");
+      return hostClearTimer(...args);
+    };
+  `, context);
+  const detail = detailFixture(), calls = [];
+  let visible = true, listener;
+  const session = new context.LDLive.TopicSession({
+    detail, now: clock.now, isVisible: () => visible,
+    client: {
+      watch(topicId, options, handler) { listener = handler; return { watchId: "receiver", ready: Promise.resolve({ presenceEnabled: true }) }; },
+      unwatch() {}
+    },
+    forum: {
+      requestQueue: { cooldown: () => 0 },
+      async request(path) { calls.push(path); return { [presenceName]: { count: 0, last_message_id: 20, users: [] } }; }
+    }
+  });
+  await session.start();
+  assert.equal(session.status().phase, "active", "start -> kick must not pause before the presence GET");
+  await clock.advance(0);
+  assert.equal(calls.length, 1, "typing visibility initializes without opening an editor");
+  assert.equal(session.status().presenceReady, true);
+  listener("topic", { id: 103, post_number: 3, type: "created" }, 11);
+  visible = false; session.visibilityChanged();
+  visible = true; session.visibilityChanged();
+  session.pause(new Error("manual pause"));
+  session.refresh();
+  session.stop();
+  await clock.advance(60000);
+  assert.equal(calls.length, 1, "all timer cleanup paths must preserve the browser receiver too");
+});
+
 test("real shared RequestQueue latency cannot compress successive live HTTP starts below five seconds", async t => {
   const clock = clockFixture(), blockedForeground = deferred(), network = [];
   const context = runtime(clock, {
@@ -158,6 +202,27 @@ test("real shared RequestQueue latency cannot compress successive live HTTP star
   assert.deepEqual(live.map(value => new URL(value.path, "https://linux.do").searchParams.getAll("post_ids[]")), [["103"], ["104"]]);
   await clock.advance(60000);
   assert.equal(network.length, 3, "catch-up must become idle rather than poll or duplicate requests");
+});
+
+test("presence gaps arriving throughout a stale in-flight recovery coalesce and then stop", async t => {
+  const recovery = deferred();
+  let reads = 0;
+  const oldPresence = { [presenceName]: { count: 0, last_message_id: 20, users: [] } };
+  const f = fixture({ presenceEnabled: true, requestResponse: () => ++reads === 1 ? oldPresence : recovery.promise });
+  t.after(() => { recovery.resolve(oldPresence); f.session.stop(); });
+  await f.session.start();
+  await f.clock.advance(0);
+  f.event("presence", { count_delta: 1 }, 22);
+  await f.clock.advance(5000);
+  for (let messageId = 23; messageId < 40; messageId++) f.event("presence", { count_delta: 1 }, messageId);
+  recovery.resolve(oldPresence);
+  await settle();
+  assert.match(f.session.status().presenceError, /手动/);
+  for (let messageId = 40; messageId < 60; messageId++) {
+    f.event("presence", { count_delta: 1 }, messageId);
+    await f.clock.advance(5000);
+  }
+  assert.equal(reads, 2, "one initial GET and one failed gap recovery, regardless of later deltas");
 });
 
 for (const change of [

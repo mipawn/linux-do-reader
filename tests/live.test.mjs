@@ -329,6 +329,138 @@ test("the parent topic abort releases the live subscriptions", async () => {
   assert.equal(f.session.stopped, true);
 });
 
+for (const presence of [
+  { count: 0, last_message_id: null, users: [] },
+  { count: 0, last_message_id: null },
+  { count: 3, last_message_id: null },
+  { count: 1, last_message_id: null, users: [{ id: 8, username: "other" }] }
+]) {
+  test(`native null presence cursor is valid with count ${presence.count} in ${presence.users ? "user" : "anonymous"} mode`, async t => {
+    const f = fixture({ presenceEnabled: true, presence }); t.after(() => f.session.stop());
+    await f.session.start(); await f.clock.advance(0);
+    assert.equal(f.session.status().phase, "active"); assert.equal(f.session.status().presenceReady, true);
+    assert.equal(f.session.presence.cursor, 0); assert.equal(f.session.status().count, presence.count);
+    if (presence.users) f.event("presence", { entering_users: [{ id: 9, username: "next" }] }, 1);
+    else f.event("presence", { count_delta: 1 }, 1);
+    assert.equal(f.session.presence.cursor, 1); assert.equal(f.session.status().count, presence.count + 1);
+    await f.clock.advance(120000); assert.equal(f.calls.length, 1);
+  });
+}
+
+for (const presence of [
+  undefined, { count: 0, users: [] }, { count: 0, last_message_id: -1, users: [] },
+  { count: "0", last_message_id: null }, { count: 0.5, last_message_id: 0 },
+  { count: 0, last_message_id: 0, users: {} }
+]) {
+  test(`malformed presence ${JSON.stringify(presence)} degrades only typing and never retries from events`, async t => {
+    const f = fixture({ presenceEnabled: true, requestResponse: () => ({ [presenceName]: presence }) });
+    t.after(() => f.session.stop()); await f.session.start(); await f.clock.advance(0);
+    assert.equal(f.session.status().phase, "active"); assert.equal(f.session.status().error, undefined);
+    assert.match(f.session.status().presenceError, /未返回有效/); assert.equal(f.session.status().presenceReady, false);
+    for (let i = 1; i <= 250; i++) f.event("presence", { entering_users: [{ id: 8 }] }, i);
+    topic(f, 3, "created", 11); await f.clock.advance(120000);
+    assert.equal(f.detail.posts.has(103), true); assert.equal(f.calls.length, 2);
+    assert.equal(f.calls[1].kind, "posts"); assert.ok(f.session.presenceBuffer.length <= 200);
+  });
+}
+
+for (const status of [0, 401, 403, 404, 503]) {
+  test(`presence failure HTTP ${status} without a server wait does not suspend正文`, async t => {
+    const f = fixture({ presenceEnabled: true, requestResponse: () => { throw Object.assign(new Error("presence failed"), { status }); } });
+    t.after(() => f.session.stop()); await f.session.start(); await f.clock.advance(0);
+    assert.equal(f.session.status().phase, "active"); assert.equal(f.session.status().error, undefined);
+    assert.equal(f.session.status().presenceReady, false);
+    if ([401, 403, 404].includes(status)) { assert.equal(f.session.status().presenceUnavailable, true); assert.equal(f.session.refreshPresence(), false); }
+    topic(f, 2, "revised", 11); await f.clock.advance(120000);
+    assert.deepEqual(f.calls.map(c => c.kind), ["request", "posts"]);
+  });
+}
+
+for (const shared of ["429", "queue", "503 wait"]) {
+  test(`presence ${shared} retains shared pause and never automatically resumes`, async t => {
+    const f = fixture({ presenceEnabled: true, requestResponse: () => {
+      if (shared === "queue") f.cooldown(5000);
+      throw Object.assign(new Error("wait"), shared === "429" ? { status: 429, retryAt: 5000 } : shared === "503 wait" ? { status: 503, retryAfter: 5000 } : {});
+    }});
+    t.after(() => f.session.stop()); await f.session.start(); await f.clock.advance(0);
+    assert.equal(f.session.status().phase, "paused"); topic(f, 3, "created", 11);
+    await f.clock.advance(120000); assert.equal(f.calls.length, 1); assert.equal(f.detail.posts.has(103), false);
+    assert.equal(f.session.refreshPresence(), false);
+  });
+}
+
+test("a null channel reset replays a new epoch message 1 received below the old in-flight cursor 20", async t => {
+  let reads = 0, release;
+  const f = fixture({ presenceEnabled: true, requestResponse: () => ++reads === 1
+    ? { [presenceName]: { count: 0, last_message_id: 20, users: [] } }
+    : new Promise(resolve => { release = resolve; }) });
+  t.after(() => f.session.stop()); await f.session.start(); await f.clock.advance(0);
+  f.session.refreshPresence(); await f.clock.advance(5000);
+  f.event("presence", { entering_users: [{ id: 8, username: "new-epoch" }] }, 1);
+  assert.equal(f.session.presenceBuffer.length, 1);
+  release({ [presenceName]: { count: 0, last_message_id: null, users: [] } }); await settle();
+  assert.equal(f.session.presence.cursor, 1); assert.equal(f.session.status().count, 1);
+  assert.equal(f.session.status().presenceReady, true);
+  f.event("presence", { leaving_user_ids: [8] }, 2);
+  assert.equal(f.session.status().count, 0); assert.equal(f.session.presence.cursor, 2);
+  await f.clock.advance(120000); assert.equal(f.calls.length, 2);
+});
+
+test("explicit presence recovery is not starved by pending or continuous正文 events", async t => {
+  let reads = 0;
+  const f = fixture({ presenceEnabled: true, requestResponse: () => ({ [presenceName]: ++reads === 1 ? {} : { count: 0, last_message_id: null, users: [] } }) });
+  t.after(() => f.session.stop()); await f.session.start(); await f.clock.advance(0);
+  f.session.refreshPresence(); topic(f, 3, "created", 11);
+  await f.clock.advance(5000);
+  assert.equal(f.calls.length, 2); assert.ok(f.calls[1].path.startsWith("/presence/"));
+  assert.equal(f.calls[1].options.background, false); assert.equal(f.session.presenceManual, false);
+  assert.equal(f.session.status().presenceError, null);
+  for (let floor = 4; floor <= 8; floor++) { topic(f, floor, "created", floor + 8); await f.clock.advance(5000); }
+  assert.equal(f.detail.posts.has(103), true); assert.equal(f.detail.posts.has(108), true);
+  assert.ok(f.calls.filter(c => c.kind === "posts").every(c => c.options.background === true));
+  assert.equal(f.calls.filter(c => c.path?.startsWith("/presence/")).length, 2);
+  const count = f.calls.length; await f.clock.advance(120000); assert.equal(f.calls.length, count);
+});
+
+test("presence-only recovery coalesces clicks and adds exactly one foreground presence snapshot, no topic reload", async t => {
+  let reads = 0;
+  const f = fixture({ presenceEnabled: true, requestResponse: () => ({ [presenceName]: ++reads === 1 ? {} : { count: 0, last_message_id: null, users: [] } }) });
+  t.after(() => f.session.stop()); await f.session.start(); await f.clock.advance(0);
+  assert.equal(f.session.refreshPresence(), true); assert.equal(f.session.refreshPresence(), false);
+  await f.clock.advance(5000); assert.equal(f.calls.length, 2);
+  assert.ok(f.calls.every(c => c.path.startsWith("/presence/"))); assert.equal(f.calls[1].options.background, false);
+  assert.equal(f.calls[1].options.priority, 0); assert.equal(f.session.status().presenceError, null);
+  assert.equal(f.session.status().presenceReady, true); assert.equal(f.session.topicNeeded, false);
+  await f.clock.advance(120000); assert.equal(f.calls.length, 2);
+});
+
+for (const changed of [false, true]) {
+  test(`a null resnapshot ${changed ? "preserves newer in-flight entering deltas" : "can reset an unchanged stale channel baseline"}`, async t => {
+    let release, reads = 0;
+    const f = fixture({ presenceEnabled: true, requestResponse: () => ++reads === 1
+      ? { [presenceName]: { count: 0, last_message_id: 20, users: [] } }
+      : new Promise(resolve => { release = resolve; }) });
+    t.after(() => f.session.stop()); await f.session.start(); await f.clock.advance(0);
+    assert.equal(f.session.refreshPresence(), true); await f.clock.advance(5000);
+    if (changed) f.event("presence", { entering_users: [{ id: 8, username: "new" }] }, 21);
+    release({ [presenceName]: { count: 0, last_message_id: null, users: [] } }); await settle();
+    assert.equal(f.session.presence.cursor, changed ? 21 : 0); assert.equal(f.session.status().count, changed ? 1 : 0);
+    assert.equal(f.session.status().presenceReady, true); await f.clock.advance(120000); assert.equal(f.calls.length, 2);
+  });
+}
+
+test("a first null snapshot replays buffered first-channel events, and late snapshots cannot revive stopped topics", async t => {
+  let release;
+  const f = fixture({ presenceEnabled: true, requestResponse: () => new Promise(resolve => { release = resolve; }) });
+  t.after(() => f.session.stop()); await f.session.start(); await f.clock.advance(0);
+  f.event("presence", { entering_users: [{ id: 8, username: "new" }] }, 1);
+  release({ [presenceName]: { count: 0, last_message_id: null, users: [] } }); await settle();
+  assert.equal(f.session.presence.cursor, 1); assert.equal(f.session.status().count, 1);
+  f.session.refreshPresence(); await f.clock.advance(5000); f.session.stop();
+  release({ [presenceName]: { count: 0, last_message_id: null, users: [] } }); await settle();
+  assert.equal(f.session.presence.cursor, 1); assert.equal(f.session.status().count, 1); assert.equal(f.clock.tasks.size, 0);
+});
+
 test("presence uses one queued initial snapshot and native sequenced deltas, excluding ourselves", async () => {
   const f = fixture({ presenceEnabled: true, presence: { count: 2, last_message_id: 20,
     users: [{ id: 7, username: "self" }, { id: 8, username: "other" }] } });
@@ -402,6 +534,47 @@ test("a stale presence snapshot pauses only presence recovery and never loops on
   topic(f, 3, "created", 11);
   await f.clock.advance(1000);
   assert.equal(f.calls.length, 3, "topic updates remain usable after a stale presence snapshot");
+});
+
+test("unsequenced events cannot cancel or latch a queued explicit presence retry", async t => {
+  const f = fixture({ presenceEnabled: true }); t.after(() => f.session.stop());
+  await f.session.start(); await f.clock.advance(0);
+  f.event("presence", { entering_users: [{ id: 8 }] });
+  assert.equal(f.session.refreshPresence(), true);
+  f.event("presence", { entering_users: [{ id: 9 }] });
+  assert.equal(f.session.presenceNeeded, true);
+  await f.clock.advance(5000);
+  assert.equal(f.calls.length, 2); assert.equal(f.calls[1].options.background, false);
+  assert.equal(f.session.presenceManual, false);
+  assert.equal(f.session.status().phase, "active");
+  await f.clock.advance(120000); assert.equal(f.calls.length, 2);
+  assert.equal(f.session.refreshPresence(), true);
+});
+
+test("missing presence message ids cannot turn each incoming event into another snapshot", async () => {
+  const f = fixture({ presenceEnabled: true });
+  await f.session.start();
+  assert.equal(f.session.status().presenceReady, false);
+  // Even an event racing the initial GET must not cause it to repeat forever.
+  f.event("presence", { entering_users: [{ id: 8 }] });
+  await f.clock.advance(0);
+  assert.equal(f.calls.length, 1);
+  assert.match(f.session.status().presenceError, /消息序号/);
+  assert.equal(f.session.status().presenceReady, false);
+  for (let i = 0; i < 20; i++) {
+    f.event("presence", { count_delta: 1 });
+    await f.clock.advance(5000);
+  }
+  assert.equal(f.calls.length, 1, "unsequenced presence traffic never starts automatic recovery GETs");
+  topic(f, 3, "created", 11);
+  await f.clock.advance(1000);
+  assert.equal(f.calls.length, 2, "only presence is degraded; topic updates remain active");
+  assert.equal(f.calls[1].options.requestSource, "实时楼层更新");
+  f.session.refresh();
+  await f.clock.advance(60000);
+  assert.equal(f.calls.filter(call => call.path?.startsWith("/presence/")).length, 2,
+    "an explicit refresh can read one presence snapshot, not re-enable a retry loop");
+  f.session.stop();
 });
 
 test("a missing/forbidden presence channel is terminal for this session, not a retryable empty state", async () => {

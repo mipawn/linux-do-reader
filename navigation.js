@@ -13,6 +13,7 @@
     const parts = pathname.split("/").filter(Boolean);
     const view = ["latest", "new", "unseen", "hot", "top", "posted", "read", "bookmarks"].includes(parts[0]) ? parts[0] : "latest";
     const params = new URLSearchParams(search);
+    params.delete("ld-reader");
     let path = pathname === "/" ? "/latest" : pathname.replace(/\/$/, "");
     if (parts[0] === "top" && parts[1]) {
       path = "/top";

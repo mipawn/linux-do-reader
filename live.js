@@ -96,7 +96,10 @@
   // native presence retries, view/timing writes, or automatic write replays.
   class TopicSession {
     constructor({ client, forum, detail, isVisible = () => true, currentUserId, presenceEnabled = true,
-      onChange = () => {}, onStatus = () => {}, now = () => Date.now(), setTimer = setTimeout, clearTimer = clearTimeout,
+      onChange = () => {}, onStatus = () => {}, now = () => Date.now(),
+      // Browser timer functions brand-check their receiver. Never store a raw
+      // Window method and then invoke it with a TopicSession as `this`.
+      setTimer = (...args) => globalThis.setTimeout(...args), clearTimer = (...args) => globalThis.clearTimeout(...args),
       interval = 5000, debounce = 1000 } = {}) {
       Object.assign(this, { client, forum, detail, isVisible, currentUserId, presenceEnabled, onChange, onStatus,
         now, setTimer, clearTimer, interval, debounce });
@@ -112,6 +115,7 @@
       this.recoveryChecks = new Map();
       this.presence = { users: new Map(), count: 0, cursor: null, usersMode: false };
       this.presenceBuffer = [];
+      this.presenceRevision = 0;
       this.lastRead = -Infinity;
       this.phase = "connecting";
     }
@@ -121,7 +125,10 @@
       return { phase: this.phase, busy: !!this.busy, pending: this.pending.size, error: this.error?.message,
         retryAt: this.error?.retryAt || 0, users,
         count: this.presence.usersMode ? users.length : this.presence.count,
-        presenceUnavailable: !!this.presenceUnavailable, presenceError: this.presenceError };
+        presenceReady: this.presence.cursor !== null && !this.presenceError && !this.presenceNeeded,
+        presenceBusy: !!this.readingPresence && this.busy,
+        presenceUnavailable: !!this.presenceUnavailable, presenceError: this.presenceError,
+        requestSource: this.error?.requestSource };
     }
 
     emit() { if (!this.stopped) this.onStatus(this.status()); }
@@ -201,13 +208,33 @@
       this.emit();
     }
 
+    bufferPresence(data, messageId) {
+      this.presenceBuffer.push({ data, messageId });
+      if (this.presenceBuffer.length > 200) this.presenceBuffer.splice(0, this.presenceBuffer.length - 200);
+    }
+
     presenceEvent(data, messageId) {
-      if (!cursor(messageId)) { this.presenceNeeded = !this.presenceError; this.kick(); return; }
-      if (this.presence.cursor !== null && messageId <= this.presence.cursor) return;
+      if (!cursor(messageId)) {
+        // Without channel sequence numbers no delta can be reconciled safely.
+        // Keep the one initial snapshot, but do not turn each such event into
+        // another /presence/get request. Explicit refresh may read it once.
+        this.presenceUnsequenced = true;
+        if (this.presence.cursor !== null) {
+          if (!this.presenceManual && !this.manual) this.presenceNeeded = false;
+          this.presenceError = "正在回复状态缺少消息序号，可手动更新。";
+          this.emit();
+        }
+        return;
+      }
+      if (this.presence.cursor !== null && messageId <= this.presence.cursor) {
+        // A null response can start a new channel epoch at zero. Until this GET
+        // resolves, retain low ids too; ordinary snapshots still discard them.
+        if (this.readingPresence) this.bufferPresence(data, messageId);
+        return;
+      }
       if (this.presence.cursor === null || messageId !== this.presence.cursor + 1 || this.presenceError) {
-        this.presenceBuffer.push({ data, messageId });
-        if (this.presenceBuffer.length > 200) this.presenceBuffer.splice(0, this.presenceBuffer.length - 200);
-        this.presenceNeeded = !this.presenceError;
+        this.bufferPresence(data, messageId);
+        this.presenceNeeded ||= !this.presenceError;
         this.kick();
         return;
       }
@@ -216,6 +243,7 @@
     }
 
     applyPresence(data, messageId) {
+      this.presenceRevision++;
       if (this.presence.usersMode) {
         for (const user of data.entering_users || []) if (id(user?.id)) this.presence.users.set(user.id, user);
         for (const userId of data.leaving_user_ids || []) this.presence.users.delete(userId);
@@ -240,20 +268,43 @@
       this.emit();
     }
 
+    nextOperation() {
+      if (this.presenceNeeded && (this.presence.cursor === null || this.presenceManual)) return "正在回复状态";
+      if (this.topicNeeded) return "实时话题补读";
+      if (this.pending.size) return "实时楼层更新";
+      if (this.presenceNeeded) return "正在回复状态";
+      return "实时更新";
+    }
+
     async flush() {
       if (this.stopped || this.error || !this.isVisible() || this.busy || this.detail.moreBusy) return;
-      if (this.forum.requestQueue.cooldown()) { this.pause(this.forum.requestQueue.busyError()); return; }
+      const operation = this.nextOperation();
+      if (this.forum.requestQueue.cooldown()) { this.pause(this.forum.requestQueue.busyError(operation)); return; }
       this.busy = true;
+      this.readingPresence = operation === "正在回复状态";
       this.lastRead = this.now();
       this.emit();
       try {
-        if (this.presenceNeeded && this.presence.cursor === null) await this.readPresence();
+        if (this.readingPresence) await this.readPresence();
         else if (this.topicNeeded) await this.readTopic();
         else if (this.pending.size) await this.readPosts();
-        else if (this.presenceNeeded) await this.readPresence();
       } catch (error) {
-        if (!this.stopped && error.name !== "AbortError") this.pause(error);
+        if (!this.stopped && error.name !== "AbortError") {
+          const waiting = error.status === 429 || this.forum.requestQueue.cooldown() > 0 ||
+            error.retryAt > this.now() || Number.isFinite(error.retryAfter) && error.retryAfter > 0;
+          if (this.readingPresence && !waiting) {
+            this.presenceNeeded = false;
+            this.presenceError = error.message;
+            if ([401, 403, 404].includes(error.status)) {
+              this.presenceUnavailable = true;
+              this.presenceEnabled = false;
+              this.presenceBuffer = [];
+            }
+          } else this.pause(error);
+        }
       } finally {
+        if (this.readingPresence) this.presenceManual = false;
+        this.readingPresence = false;
         // The shared lane may delay the real HTTP start. Pace from completion,
         // not enqueue time, so foreground traffic cannot compress live batches.
         this.lastRead = this.now();
@@ -266,7 +317,10 @@
       }
     }
 
-    options() { return { signal: this.controller.signal, background: !this.manual, priority: this.manual ? 0 : 2 }; }
+    options(requestSource) {
+      const manual = this.manual || requestSource === "正在回复状态" && this.presenceManual;
+      return { signal: this.controller.signal, background: !manual, priority: manual ? 0 : 2, requestSource };
+    }
     placeholder(post, deleted = false) {
       // Scrub stale identities and bodies immediately. Descendants retain the
       // real floor and ancestry; absence alone never proves a deletion.
@@ -296,7 +350,7 @@
       const ids = batch.map(([postId]) => postId);
       for (const postId of ids) this.inFlight.add(postId);
       try {
-        const posts = await this.forum.postsPage(detail.data.id, ids, this.controller.signal, this.options());
+        const posts = await this.forum.postsPage(detail.data.id, ids, this.controller.signal, this.options("实时楼层更新"));
         if (this.stopped) return;
         const returned = new Set();
         let opChanged = false;
@@ -334,7 +388,7 @@
       const { detail } = this;
       const revision = this.revision;
       this.topicNeeded = false;
-      const snapshot = await this.forum.request(`/t/${detail.data.id}.json`, this.options());
+      const snapshot = await this.forum.request(`/t/${detail.data.id}.json`, this.options("实时话题补读"));
       if (this.stopped) return;
       if (snapshot.id !== detail.data.id || !Array.isArray(snapshot.post_stream?.stream) || !Array.isArray(snapshot.post_stream?.posts)) throw new Error("原站未返回有效的话题更新，请重试。");
       const before = new Set(detail.stream);
@@ -391,25 +445,32 @@
       const name = `/discourse-presence/reply/${this.detail.data.id}`;
       const query = new URLSearchParams();
       query.append("channels[]", name);
-      const response = await this.forum.request(`/presence/get.json?${query}`, this.options());
+      const revision = this.presenceRevision;
+      const response = await this.forum.request(`/presence/get.json?${query}`, this.options("正在回复状态"));
       if (this.stopped) return;
-      const snapshot = response[name];
+      const snapshot = response?.[name];
       this.presenceNeeded = false;
       if (snapshot === null) {
+        this.presenceError = null;
         this.presenceUnavailable = true;
         this.presenceEnabled = false;
         this.presence = { users: new Map(), count: 0, cursor: null, usersMode: false };
         this.presenceBuffer = [];
         return;
       }
-      if (!snapshot || !cursor(snapshot.last_message_id) || !Number.isFinite(snapshot.count) || snapshot.count < 0 ||
+      if (!snapshot || !(cursor(snapshot.last_message_id) || snapshot.last_message_id === null) || !Number.isSafeInteger(snapshot.count) || snapshot.count < 0 ||
           snapshot.users != null && !Array.isArray(snapshot.users)) throw new Error("原站未返回有效的正在回复状态，请重试。");
       this.presenceUnavailable = false;
       this.presenceError = null;
       // Continuous deltas may have advanced the state during this GET. Never
       // roll their cursor/users back to an older manual/recovery snapshot.
-      if (this.presence.cursor === null || snapshot.last_message_id >= this.presence.cursor) {
-        this.presence = { cursor: snapshot.last_message_id, count: snapshot.count, usersMode: Array.isArray(snapshot.users),
+      // Discourse serializes an absent MessageBus backlog id as null. Its native
+      // client uses null + 1 === 1 for the first delta: normalize only explicit
+      // null, never a missing field/-1, and preserve the snapshot's real users.
+      const lastId = snapshot.last_message_id === null ? 0 : snapshot.last_message_id;
+      const freshReset = snapshot.last_message_id === null && revision === this.presenceRevision;
+      if (this.presence.cursor === null || freshReset || lastId >= this.presence.cursor) {
+        this.presence = { cursor: lastId, count: snapshot.count, usersMode: Array.isArray(snapshot.users),
           users: new Map((snapshot.users || []).filter(user => id(user?.id)).map(user => [user.id, user])) };
       }
       const buffered = this.presenceBuffer.sort((a, b) => a.messageId - b.messageId);
@@ -423,12 +484,27 @@
         }
         this.applyPresence(data, messageId);
       }
+      if (this.presenceUnsequenced) this.presenceError = "正在回复状态缺少消息序号，可手动更新。";
       this.emit();
+    }
+
+    refreshPresence() {
+      if (this.stopped || !this.connected || !this.presenceEnabled || this.presenceUnavailable ||
+          this.error || this.presenceManual || this.readingPresence) return false;
+      if (this.forum.requestQueue.cooldown()) {
+        this.pause(this.forum.requestQueue.busyError("正在回复状态"));
+        return false;
+      }
+      this.presenceManual = true;
+      this.presenceNeeded = true;
+      this.kick(0);
+      this.emit();
+      return true;
     }
 
     refresh() {
       if (this.stopped) return;
-      if (this.forum.requestQueue.cooldown()) { this.pause(this.forum.requestQueue.busyError()); return; }
+      if (this.forum.requestQueue.cooldown()) { this.pause(this.forum.requestQueue.busyError("实时更新")); return; }
       if (this.error?.retryAt > this.now()) return;
       this.error = null;
       this.presenceError = null;

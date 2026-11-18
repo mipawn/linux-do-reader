@@ -31,7 +31,13 @@ function fixture(options = {}) {
   const navigation = evented();
   navigation.addEventListener = navigation.on;
   const appEvents = evented(), router = evented();
+  const styleValues = new Map(), hydratedRecords = new Map();
   const document = {
+    documentElement: { style: {
+      setProperty(key, value) { styleValues.set(key, value); },
+      removeProperty(key) { styleValues.delete(key); },
+      getPropertyValue(key) { return styleValues.get(key) || ""; }
+    } },
     querySelector(selector) { return selector === "button.login-button" ? options.loginControl : null; },
     getElementById(id) { return id === "data-preloaded" && options.preloaded ? { textContent: JSON.stringify(options.preloaded) } : null; }
   };
@@ -61,23 +67,47 @@ function fixture(options = {}) {
   if (options.unknownBus) bus.callbacks = undefined;
   const store = {
     createRecord(type, data) {
+      const key = `${type}:${data.id}`;
+      const existing = options.nativeHydration && data.id && hydratedRecords.get(key);
+      if (existing) {
+        // Discourse Store._hydrate mutates attrs/munge output: unchanged fields
+        // (draft_key included) are deleted before existing.setProperties().
+        const id = data.id;
+        delete data.id;
+        for (const field of Object.keys(data)) if (existing[field] === data[field]) delete data[field];
+        existing.setProperties(data);
+        data.id = id;
+        records.push({ type, data, result: existing });
+        return existing;
+      }
       const result = new Record(data);
       if (type === "topic") result.postStream = { updateFromJson(json) { this.data = json; } };
+      if (data.id) hydratedRecords.set(key, result);
       records.push({ type, data, result });
       return result;
     }
   };
-  const Composer = { REPLY: "reply", OPEN: "open", isEditDraft: value => value.action === "edit" };
+  const Composer = { REPLY: "reply", OPEN: "open", DRAFT: "draft", CLOSED: "closed", FULLSCREEN: "fullscreen", SAVING: "saving", isEditDraft: value => value.action === "edit" };
   const composer = {
     model: options.model,
     set(key, value) { this[key] = value; },
     async open(opts) {
+      if (!opts.draftKey) throw new Error("composer opened without a proper draft key");
       opened.push(opts);
       appEvents.trigger("composer:will-open");
       if (options.cancelOpen) return;
       this.skipJumpOnSave = opts.skipJumpOnSave;
-      this.model = new Record({ topic: opts.topic, post: opts.post, action: opts.draft?.action || opts.action, draftKey: opts.draftKey,
-        reply: opts.reply || "", composeState: "open" });
+      this.model = new Record({ ...opts.draft, topic: opts.topic, post: opts.post, action: opts.draft?.action || opts.action, draftKey: opts.draftKey,
+        draftSequence: opts.draftSequence, reply: opts.draft?.reply ?? opts.reply ?? "", composeState: "open", composerHeight: "255px" });
+      this.model.setReplyTo = function (postNumber, user) { this.setProperties({ reply_to_post_number: postNumber ?? null, reply_to_user: postNumber ? user : null }); };
+      if (!opts.draft) this.model.setReplyTo(opts.post?.post_number, opts.post && { id: opts.post.user_id, username: opts.post.username });
+      document.documentElement.style.setProperty("--composer-height", this.model.composerHeight);
+    },
+    openIfDraft() {
+      if (this.model?.composeState !== Composer.DRAFT) return false;
+      this.model.set("composeState", Composer.OPEN);
+      document.documentElement.style.setProperty("--composer-height", this.model.composerHeight);
+      return true;
     },
     save(...args) { if (options.nativeSave) return Reflect.apply(options.nativeSave, this, args); throw new Error("bridge must never save or post"); },
     close() { throw new Error("bridge must not silently close a dirty draft"); }
@@ -317,6 +347,100 @@ test("reply builds native Topic/Post and opens REPLY with server draft identity 
   assert.equal(f.window.location.pathname, "/");
 });
 
+test("cached Discourse hydration cannot consume reply identity when reopening after native close", async () => {
+  const calls = [];
+  const f = fixture({ nativeHydration: true, nativeSave(force, opts) { calls.push({ force, opts }); return opts; } });
+  const originalSave = f.composer.save;
+  const payload = { topic: topic(), post: floor() }, snapshot = plain(payload);
+  assert.equal((await f.request("reply", payload)).result.opened, true);
+  const firstModel = f.composer.model, firstTopic = firstModel.topic;
+  // Native save-and-close has already preserved its draft and sets model=null.
+  // Simulate only the close lifecycle, never submit or delete any draft.
+  f.composer.model = null;
+  f.document.documentElement.style.removeProperty("--composer-height");
+  assert.equal((await f.request("reply", payload)).result.opened, true);
+  assert.notEqual(f.composer.model, firstModel);
+  assert.equal(f.composer.model.topic, firstTopic, "native identity-map record is reused");
+  assert.equal(f.records.filter(record => record.type === "topic").at(-1).data.draft_key, undefined, "mock genuinely consumes unchanged draft identity");
+  assert.deepEqual(payload, snapshot, "native hydration owns a copy, not request attrs");
+  assert.deepEqual(f.opened.map(opts => [opts.draftKey, opts.draftSequence]), [["topic_123", 5], ["topic_123", 5]]);
+  assert.deepEqual(f.draftGets, ["topic_123", "topic_123"]);
+  assert.equal(f.document.documentElement.style.getPropertyValue("--composer-height"), "255px");
+  assert.equal(calls.length, 0, "opening and reopening never submits");
+  assert.equal(f.composer.save(false, { jump: true }).jump, false);
+  assert.equal(calls.length, 1, "reopening does not nest old save guards");
+  await f.request("dispose", {});
+  assert.equal(f.composer.save, originalSave);
+});
+
+test("collapsed native replies use openIfDraft to restore height, body and save protection", async () => {
+  const f = fixture({ nativeSave(_force, opts) { return opts; } });
+  await f.request("reply", { topic: topic(), post: floor() });
+  const model = f.composer.model;
+  model.setProperties({ reply: "private unsaved body", whisper: true, composeState: "draft", composerHeight: "410px" });
+  f.document.documentElement.style.setProperty("--composer-height", "40px");
+  const response = await f.request("reply", { topic: topic(), post: floor({ id: 13, post_number: 3 }) });
+  assert.equal(response.result.opened, true);
+  assert.equal(f.composer.model, model);
+  assert.equal(model.reply, "private unsaved body");
+  assert.equal(model.whisper, true);
+  assert.equal(model.composeState, "open");
+  assert.equal(f.document.documentElement.style.getPropertyValue("--composer-height"), "410px");
+  assert.equal(model.reply_to_post_number, 3);
+  assert.equal(model.reply_to_user.username, "author");
+  assert.equal(model.reply_to_user.id, 8);
+  assert.equal(f.opened.length, 1);
+  assert.equal(f.draftGets.length, 1);
+  assert.equal(f.composer.save(false, { jump: true }).jump, false);
+  assert.doesNotMatch(JSON.stringify(response), /private unsaved body/);
+  await f.request("reply", { topic: topic() });
+  assert.equal(model.post, null);
+  assert.equal(model.reply_to_post_number, null);
+  assert.equal(model.reply_to_user, null);
+  assert.equal(model.reply, "private unsaved body");
+});
+
+test("unsupported collapsed lifecycle fails without changing the native draft or target", async () => {
+  const f = fixture();
+  await f.request("reply", { topic: topic(), post: floor() });
+  const model = f.composer.model, oldPost = model.post;
+  model.setProperties({ reply: "keep original", composeState: "draft" });
+  f.composer.openIfDraft = undefined;
+  const response = await f.request("reply", { topic: topic(), post: floor({ id: 13, post_number: 3 }) });
+  assert.equal(response.error.code, "COMPOSER_UNSUPPORTED");
+  assert.equal(model.composeState, "draft");
+  assert.equal(model.post, oldPost);
+  assert.equal(model.reply, "keep original");
+  assert.equal(f.opened.length, 1);
+  assert.equal(f.draftGets.length, 1);
+});
+
+test("persisted reply drafts keep native registered fields and targets for future autosave", async () => {
+  const data = { action: "reply", reply: "private saved body", whisper: true, typingTime: 23,
+    reply_to_post_number: 6, reply_to_user: { id: 9, username: "saved-author" }, pluginField: { keep: true } };
+  const f = fixture({ draftResponse: async () => ({ draft: JSON.stringify(data), draft_sequence: 11 }) });
+  const response = await f.request("reply", { topic: topic(), post: floor() });
+  assert.equal(response.result.opened, true);
+  assert.deepEqual(plain(f.opened[0].draft), data);
+  assert.equal(f.composer.model.reply_to_post_number, 6, "restoration never silently changes a saved draft's target");
+  assert.equal(f.composer.model.typingTime, 23);
+  assert.deepEqual(plain(f.composer.model.pluginField), { keep: true });
+  assert.equal(f.composer.model.draftSequence, 11);
+  assert.doesNotMatch(JSON.stringify(response), /private saved body|saved-author|pluginField/);
+});
+
+test("fullscreen same-topic replies remain fullscreen and retain the unsaved body", async () => {
+  const f = fixture();
+  await f.request("reply", { topic: topic(), post: floor() });
+  const model = f.composer.model;
+  model.setProperties({ composeState: "fullscreen", reply: "fullscreen draft" });
+  const response = await f.request("reply", { topic: topic(), post: floor({ id: 13, post_number: 3 }) });
+  assert.equal(response.result.opened, true);
+  assert.equal(model.composeState, "fullscreen");
+  assert.equal(model.reply, "fullscreen draft");
+  assert.equal(f.opened.length, 1);
+});
+
 test("reply to the first floor is native topic-level reply, not reply_to_post_number 1", async () => {
   const f = fixture();
   await f.request("reply", { topic: topic(), post: floor({ id: 10, post_number: 1 }) });
@@ -406,9 +530,21 @@ test("429 during explicit native draft load stops immediately without any retry"
   const response = await f.request("reply", { topic: topic(), post: floor() });
   await settle();
   assert.equal(response.error.status, 429);
+  assert.equal(response.error.requestSource, "draft");
   assert.equal(f.draftGets.length, 1);
   assert.equal(f.opened.length, 0);
   assert.doesNotMatch(JSON.stringify(response), /private response/);
+});
+
+test("native editor errors are classified as editor work rather than mislabeled draft reads", async () => {
+  const f = fixture();
+  f.composer.open = async () => { throw { status: 429, responseText: "private editor response" }; };
+  const response = await f.request("reply", { topic: topic(), post: floor() });
+  assert.equal(response.error.status, 429);
+  assert.equal(response.error.requestSource, "composer");
+  assert.equal(f.draftGets.length, 1);
+  assert.equal(f.opened.length, 0);
+  assert.doesNotMatch(JSON.stringify(response), /private editor response/);
 });
 
 test("leaving home while loading a draft cancels opening, and concurrent clicks cannot open two composers", async () => {

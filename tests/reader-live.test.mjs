@@ -69,16 +69,17 @@ class Node {
 const post = (floor, extra = {}) => ({ id: 100 + floor, topic_id: 123, post_number: floor, username: `user${floor}`,
   cooked: `<p>body${floor}</p>`, created_at: "2026-11-18T01:00:00Z", ...extra });
 function fixture({ posts = [post(1), post(2)], user = { id: 7 }, data: changes = {}, reply, nativeContext,
-  url = "https://linux.do/", livePending = new Set(), page } = {}) {
+  url = "https://linux.do/", livePending = new Set(), page, topicResponse, records = [] } = {}) {
   const root = new Node("root"); root._connected = true;
   const shell = new Node("div", "shell"), toolbar = new Node(), actions = new Node(), reading = new Node(), status = new Node(), scroll = new Node();
   actions.id = "reading-actions"; reading.id = "reading"; status.id = "live-status"; status.hidden = true; scroll.id = "read-scroll";
   toolbar.append(actions); scroll.append(reading); shell.append(toolbar, status, scroll); root.append(shell);
+  const menu = new Node(); menu.id = "menu"; root.append(menu);
   const data = { id: 123, title: "Title", slug: "topic", posts_count: posts.length, message_bus_last_id: 10, chunk_size: 20,
     draft_key: "topic_123", draft_sequence: 4, tags: [], details: { can_create_post: true, notification_level: 1 }, ...changes };
   const detail = { data, posts: new Map(posts.map(value => [value.id, value])), stream: posts.map(value => value.id),
     attempted: new Set(posts.map(value => value.id)), collapsed: new Set(), sort: "oldest", controller: new AbortController(), retryAt: 0 };
-  const calls = { reply: [], requests: [], pages: [], cooked: [], context: 0, notifications: [], sessions: [], stopped: 0, refreshed: 0, kicked: 0, paused: [], deferred: [] };
+  const calls = { reply: [], requests: [], pages: [], cooked: [], context: 0, notifications: [], sessions: [], stopped: 0, refreshed: 0, kicked: 0, paused: [], deferred: [], deferredInfo: [] };
   let cooling = 0;
   const bridge = {
     async reply(...args) { calls.reply.push(plain(args)); return reply ? reply(...args) : { opened: true }; },
@@ -91,6 +92,7 @@ function fixture({ posts = [post(1), post(2)], user = { id: 7 }, data: changes =
     hasPending(id) { return livePending.has(id); }
     stop() { calls.stopped++; }
     refresh() { calls.refreshed++; }
+    refreshPresence() { calls.presenceRefreshed = (calls.presenceRefreshed || 0) + 1; }
     kick() { calls.kicked++; }
     pause(error) { calls.paused.push(error); this.options.onStatus({ phase: "paused", error: error.message, retryAt: error.retryAt, count: 0, users: [] }); }
   }
@@ -99,10 +101,11 @@ function fixture({ posts = [post(1), post(2)], user = { id: 7 }, data: changes =
     dateLabel: value => value || "", topicPath: (topic, floor) => `/t/topic/${topic.id}${floor ? `/${floor}` : ""}`,
     tagInfo: tag => typeof tag === "string" ? { name: tag, slug: tag } : tag,
     cooked(value) { calls.cooked.push(value); const node = new Node("div", "cooked"); node.textContent = value; return node; },
-    async request(path, options) { calls.requests.push({ path, options }); return { ...data, post_stream: { stream: [...detail.stream], posts } }; },
+    async request(path, options) { calls.requests.push({ path, options }); if (topicResponse) await topicResponse(path, options); return { ...data, post_stream: { stream: [...detail.stream], posts } }; },
     async postsPage(topicId, ids, signal, options) { calls.pages.push({ topicId, ids: [...ids], signal, options }); return page ? page(ids, signal) : ids.map(id => post(id - 100)); },
     requestQueue: { cooldown: () => cooling, busyError: () => Object.assign(new Error("原站限流"), { status: 429, retryAt: Date.now() + cooling, retryAfter: cooling }),
-      defer: delay => { cooling = Math.max(cooling, delay); calls.deferred.push(delay); } }
+      diagnostics: () => records,
+      defer: (delay, options = {}) => { cooling = Math.max(cooling, delay); calls.deferred.push(delay); calls.deferredInfo.push(plain(options)); } }
   };
   const location = new URL(url);
   const document = { readyState: "loading", hidden: false, activeElement: null, createElement: tag => new Node(tag), addEventListener() {}, getElementById: () => null };
@@ -120,7 +123,7 @@ function fixture({ posts = [post(1), post(2)], user = { id: 7 }, data: changes =
     updateSteps = renderList = renderFilters = closeMenu = closeSidebar = sizeReader = resetReplyPager = scheduleRecovery = () => {};
     notify = message => __calls.notifications.push(message);
     globalThis.readerTest = { state, renderReading, renderReplies, replyTo, clicked, startTopicLive,
-      pendingPostIds, loadReplies, loadContext, clearTopic, selectTopic, canReply };
+      pendingPostIds, loadReplies, loadContext, clearTopic, selectTopic, canReply, populateMenu };
     const requestedAtStart = false;
   `);
   vm.runInContext(script, context);
@@ -131,7 +134,7 @@ function fixture({ posts = [post(1), post(2)], user = { id: 7 }, data: changes =
 }
 
 test("actual reader render wires topic and available floor replies without leaking cooked data into the bridge", async () => {
-  const f = fixture(); f.render();
+  const f = fixture({ posts: [post(1), post(2, { user_id: 8, post_type: 1 })] }); f.render();
   assert.deepEqual(f.controls().map(control => control.dataset.value), ["0", "2"]);
   assert.equal(f.root.querySelectorAll(".post-actions").length, 1);
   await f.api.replyTo(2); await f.api.replyTo(0);
@@ -139,6 +142,7 @@ test("actual reader render wires topic and available floor replies without leaki
   const [topic, target] = f.calls.reply[0];
   assert.equal(topic.id, 123); assert.equal(topic.draft_key, "topic_123"); assert.equal(topic.draft_sequence, 4);
   assert.equal(target.id, 102); assert.equal(target.post_number, 2);
+  assert.equal(target.user_id, 8); assert.equal(target.post_type, 1);
   assert.equal(target.cooked, undefined); assert.equal(target.raw, undefined);
   assert.equal(f.calls.reply[1][1], null);
   assert.equal(f.calls.requests.length, 0, "opening a reply does not call an extension POST or topic GET");
@@ -193,11 +197,14 @@ test("known shared cooldown stops explicit Draft/composer work before sending an
   assert.equal(f.calls.reply.length, 0); assert.equal(f.calls.paused.length, 1); assert.match(f.calls.notifications[0], /限流/);
 });
 
-test("a native explicit Draft 429 merges its deadline into the shared queue without replaying", async () => {
-  const f = fixture({ reply: () => { throw Object.assign(new Error("native rate limit"), { status: 429, retryAfter: 7000 }); } }); f.live(); f.render();
-  await f.api.replyTo(0);
-  assert.deepEqual(f.calls.deferred, [7000]); assert.equal(f.calls.paused.length, 1); assert.equal(f.calls.reply.length, 1);
-  await f.api.replyTo(0); assert.equal(f.calls.reply.length, 1);
+test("native rate-limit deadlines and draft/editor sources merge into the shared queue without replaying", async () => {
+  for (const requestSource of ["draft", "composer", undefined]) {
+    const f = fixture({ reply: () => { throw Object.assign(new Error("native rate limit"), { status: 429, retryAfter: 7000, requestSource }); } }); f.live(); f.render();
+    await f.api.replyTo(0);
+    assert.deepEqual(f.calls.deferred, [7000]); assert.equal(f.calls.paused.length, 1); assert.equal(f.calls.reply.length, 1);
+    assert.deepEqual(f.calls.deferredInfo, [{ source: requestSource === "composer" ? "composer" : "draft", status: 429 }]);
+    await f.api.replyTo(0); assert.equal(f.calls.reply.length, 1);
+  }
 });
 
 test("native Draft server-wait failures honor the absolute deadline before the fallback duration", async () => {
@@ -229,7 +236,7 @@ test("selected topic installs one live session whose visibility guard and presen
 
 test("native presence status and manual update are wired to the actual reading pane controls", async () => {
   const f = fixture(); f.render(); f.live();
-  f.calls.sessions[0].onStatus({ phase: "active", users: [{ id: 8, username: "other" }], count: 1 });
+  f.calls.sessions[0].onStatus({ phase: "active", users: [{ id: 8, username: "other" }], count: 1, presenceReady: true });
   assert.equal(f.status.hidden, false); assert.match(f.status.textContent, /other.*正在回复/);
   const refresh = f.root.querySelector('[data-action="refresh-posts"]');
   f.api.clicked({ target: refresh }); assert.equal(f.calls.refreshed, 1);
@@ -238,6 +245,99 @@ test("native presence status and manual update are wired to the actual reading p
   assert.equal(f.calls.requests.length, 0);
   f.calls.sessions[0].onStatus({ phase: "paused", error: "网络已暂停", users: [], count: 0 });
   assert.match(f.status.textContent, /网络已暂停/);
+});
+
+test("typing presence is visible without opening the composer and distinguishes unknown from nobody", () => {
+  const f = fixture(); f.render(); f.live();
+  const options = f.calls.sessions[0];
+  assert.match(f.status.textContent, /正在回复状态尚未同步/);
+  options.onStatus({ phase: "active", users: [], count: 0, presenceReady: true });
+  assert.match(f.status.textContent, /暂无其他人正在回复/);
+  options.onStatus({ phase: "active", users: [{ id: 8, username: "other", display_username: "佬友" }], count: 1, presenceReady: true });
+  const presence = f.root.querySelector('[aria-label="正在回复状态"]');
+  assert.match(presence.textContent, /佬友正在回复/);
+  assert.equal(f.calls.reply.length, 0);
+  assert.equal(f.calls.requests.length, 0);
+});
+
+test("presence failure stays in its own row and its retry never invokes a topic refresh", () => {
+  const f = fixture(); f.render(); f.live();
+  f.calls.sessions[0].onStatus({ phase: "active", presenceError: "正在回复状态暂未同步", users: [], count: 0, presenceReady: false });
+  assert.match(f.status.textContent, /新回复自动更新/);
+  assert.doesNotMatch(f.status.textContent, /实时更新已暂停|暂无其他人/);
+  const retry = f.root.querySelector('[data-action="refresh-presence"]');
+  assert.equal(retry.disabled, false);
+  f.api.clicked({ target: retry });
+  assert.equal(f.calls.presenceRefreshed, 1); assert.equal(f.calls.refreshed, 0); assert.equal(f.calls.requests.length, 0);
+  f.calls.sessions[0].onStatus({ phase: "active", presenceBusy: true, busy: true, presenceError: "旧错误", count: 1, users: [{ id: 8, username: "stale" }] });
+  assert.match(f.status.textContent, /正在同步正在回复状态/);
+  assert.doesNotMatch(f.status.textContent, /stale/);
+  assert.equal(f.root.querySelector('[data-action="refresh-presence"]').disabled, true);
+});
+
+test("unavailable presence has no retry, while a shared cooldown still disables recovery", () => {
+  const f = fixture(); f.render(); f.live(); const update = f.calls.sessions[0].onStatus;
+  update({ phase: "active", presenceUnavailable: true, presenceError: "无权限", count: 0 });
+  assert.equal(f.root.querySelector('[data-action="refresh-presence"]'), null);
+  update({ phase: "paused", error: "限流", retryAt: Date.now()+5000, presenceError: "暂未同步", count: 0 });
+  assert.equal(f.root.querySelector('[data-action="refresh-presence"]').disabled, true);
+});
+
+test("rate-limit status preserves the operation source during the countdown", () => {
+  const f = fixture(); f.render(); f.live();
+  f.calls.sessions[0].onStatus({ phase: "paused", error: "读取正在回复状态：原站限流", retryAt: Date.now() + 7000, users: [], count: 0 });
+  assert.match(f.status.textContent, /读取正在回复状态.*原站限流/);
+  assert.equal(f.root.querySelector('[data-action="refresh-posts"]').disabled, true);
+});
+
+test("cooldown text counts down from its deadline instead of retaining a stale one-second warning", () => {
+  const f = fixture(); f.render(); f.live();
+  const update = f.calls.sessions[0].onStatus;
+  update({ phase: "paused", error: "原站返回限流（话题详情，HTTP 429），已暂停请求，请 99 秒后重试。", retryAt: Date.now() + 2000 });
+  assert.doesNotMatch(f.status.textContent, /99 秒/);
+  assert.match(f.status.textContent, /话题详情.*[12] 秒后可重试/);
+  update({ phase: "paused", error: "原站暂时不可用（HTTP 503），请 1 秒后重试。", retryAt: Date.now() - 1000 });
+  assert.match(f.status.textContent, /HTTP 503.*等待已结束，可手动重试/);
+  assert.doesNotMatch(f.status.textContent, /1 秒后重试|限流/);
+  assert.equal(f.root.querySelector('[data-action="refresh-posts"]').disabled, false);
+  assert.equal(f.calls.requests.length, 0);
+});
+
+test("topic cooldown keeps its true classification and disables retry until the deadline", async () => {
+  const retryAt = Date.now() + 2000;
+  const f = fixture({ topicResponse: () => { throw Object.assign(new Error("原站暂时不可用（HTTP 503），请 1 秒后重试。"), { status: 503, retryAt }); } });
+  f.api.state.selected = null; f.api.state.detail = null;
+  await f.api.selectTopic({ id: 123 });
+  assert.equal(f.api.state.topicRetryAt, retryAt);
+  assert.equal(f.root.querySelector('[data-action="retry-topic"]').disabled, true);
+  assert.match(f.root.textContent, /HTTP 503.*[12] 秒后可重试/);
+  assert.doesNotMatch(f.root.textContent, /限流/);
+});
+
+test("request records expose operation/time/result locally without causing another request", () => {
+  const f = fixture({ records: [
+    { requestSource: "正在回复状态", method: "GET", background: true, startedAt: 0, completedAt: 10, status: 429 },
+    { requestSource: "回复分页", method: "GET", background: false, startedAt: 12, completedAt: null, status: null }
+  ] });
+  f.render(); f.live();
+  assert.ok(f.root.querySelector('[data-action="menu"][data-value="requests"]'));
+  f.api.populateMenu("requests");
+  const menu = f.root.querySelector("#menu");
+  assert.match(menu.textContent, /正在回复状态.*后台 GET.*结果码 429/);
+  assert.match(menu.textContent, /回复分页.*前台 GET.*进行中/);
+  assert.match(menu.textContent, /不能证明是哪次操作/);
+  assert.equal(f.calls.requests.length, 0);
+  assert.equal(f.calls.reply.length, 0);
+});
+
+test("tree tools retain per-branch toggles but remove expand-all and collapse-all", () => {
+  const f = fixture({ posts: [post(1), post(2), post(3, { reply_to_post_number: 2 })] });
+  f.render();
+  assert.equal(f.root.querySelector('[data-action="expand-all"]'), null);
+  assert.equal(f.root.querySelector('[data-action="collapse-all"]'), null);
+  assert.ok(f.root.querySelector('[data-action="branch"]'));
+  f.api.clicked({ target: f.root.querySelector('[data-action="branch"]') });
+  assert.equal(f.detail.collapsed.has(2), true);
 });
 
 test("a live update preserves collapse/sort/scroll state and updates the existing tree/count", async () => {
@@ -276,6 +376,40 @@ test("a normal homepage title click fetches that topic, stays at root, and start
   assert.equal(f.calls.requests.length, 1); assert.equal(f.calls.requests[0].path, "/t/123.json");
   assert.equal(f.calls.sessions.length, 1); assert.equal(f.api.state.detail.data.id, 123);
   assert.equal(f.location.href, "https://linux.do/"); assert.ok(f.controls().length > 0);
+});
+
+test("repeated clicks while the same topic loads share one GET and keep its controller alive", async () => {
+  let release;
+  const f = fixture({ topicResponse: () => new Promise(resolve => { release = resolve; }) });
+  f.api.state.selected = null; f.api.state.detail = null;
+  const first = f.api.selectTopic({ id: 123 });
+  const signal = f.calls.requests[0].options.signal;
+  await f.api.selectTopic({ id: 123 });
+  assert.equal(f.calls.requests.length, 1); assert.equal(signal.aborted, false);
+  assert.equal(f.api.state.topicBusy, true);
+  release(); await first;
+  assert.equal(f.api.state.topicBusy, false); assert.equal(f.calls.sessions.length, 1);
+});
+
+test("a failed topic load can be explicitly retried without a stuck busy guard", async () => {
+  let count = 0;
+  const f = fixture({ topicResponse: () => { if (++count === 1) throw new Error("offline"); } });
+  f.api.state.selected = null; f.api.state.detail = null;
+  await f.api.selectTopic({ id: 123 });
+  assert.equal(f.api.state.topicBusy, false); assert.equal(f.api.state.topicError, "offline");
+  await f.api.selectTopic({ id: 123 });
+  assert.equal(f.calls.requests.length, 2); assert.ok(f.api.state.detail);
+});
+
+test("automatic reply pages carry the no-background-retry policy; explicit pages remain foreground", async () => {
+  for (const background of [true, false]) {
+    const f = fixture(); f.detail.stream.push(103);
+    await f.api.loadReplies({ background });
+    assert.equal(f.calls.pages[0].options.background, background);
+  }
+  const reader = source("reader.js");
+  assert.match(reader, /load: \(\) => loadReplies\(\{ background: true \}\)/);
+  assert.equal((reader.match(/autoLoadLimit: 1/g) || []).length, 2);
 });
 
 test("reading pane CSS reserves separate toolbar/status/content rows and preserves hidden semantics", () => {

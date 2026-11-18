@@ -16,7 +16,7 @@
   const number = new Intl.NumberFormat("zh-CN", { notation: "compact" });
   const state = {
     view: "latest", category: null, tag: null, query: "", initialFeedPath: null, next: null, listGeneration: 0, rows: [], categories: new Map(), tags: new Map(),
-    user: undefined, selected: null, detail: null, openMenu: null, sidebarMenu: null, onScreen: false
+    user: undefined, selected: null, topicBusy: false, detail: null, openMenu: null, sidebarMenu: null, onScreen: false
   };
   const outletClass = "ld-reader-active";
   let host, root, listRequest, topicRequest, outlet, modeSwitch, nativeHeader, headerObserver, listPager, replyPager;
@@ -205,10 +205,11 @@
     });
     listPager = new globalThis.LDScroll.Pager({
       viewport: $("#list-scroll"),
+      autoLoadLimit: 1,
       canLoad: () => state.onScreen && !state.listBusy && !state.listError && !!state.next,
       getKey: () => `${state.listGeneration}:${state.view}:${state.category?.id || ""}:${state.tag?.slug || ""}:${state.query}:${state.initialFeedPath || ""}:${state.next}`,
       getSentinel: () => $("#list-sentinel"),
-      load: () => loadList(true),
+      load: () => loadList(true, false, { background: true }),
       onStateChange: paging => {
         state.listPaging = paging;
         if (root) renderListFooter();
@@ -277,6 +278,13 @@
     return add(element("div", "status"), element("p", "", message), action && button(label, action, { className: "secondary-button" }));
   }
 
+  function recoveryMessage(message, retryAt) {
+    if (!retryAt) return message;
+    const reason = String(message).replace(/(?:，已暂停请求)?[，；]?请\s*\d+\s*秒后重试[。.]?$/, "");
+    const seconds = Math.max(0, Math.ceil((retryAt - Date.now()) / 1000));
+    return `${reason} · ${seconds ? `${seconds} 秒后可重试` : "等待已结束，可手动重试"}`;
+  }
+
   function renderListFooter() {
     const footer = $("#list-footer");
     footer.replaceChildren();
@@ -285,7 +293,7 @@
       if (privateModes.has(state.view) && state.user === null) {
         footer.append(add(status("登录后即可查看这个列表。"), anchor("前往 Linux.do 登录", "/login", "secondary-button", "out")));
       } else {
-        const error = status(remaining ? `原站暂时繁忙，${Math.ceil(remaining / 1000)} 秒后可重试。` : state.listError,
+        const error = status(recoveryMessage(state.listError, state.listRetryAt),
           state.next && state.rows.length ? "more-topics" : "refresh");
         error.querySelector("button").disabled = remaining > 0;
         footer.append(error);
@@ -297,7 +305,7 @@
         state.view === "bookmarks" ? "收藏的话题会显示在这里。" : "这个列表暂时没有话题。";
       footer.append(status(message));
     } else if (state.next) footer.append(add(element("span", "", state.listPaging?.status === "paused"
-      ? "连续分页没有新增可见内容，已暂停自动加载，可手动继续。" : "接近底部自动加载"),
+      ? "连续分页没有新增可见内容，已暂停自动加载，可手动继续。" : "接近底部按需加载，每次滚动至多一页"),
       button("加载更多", "more-topics", { className: "secondary-button", symbol: "down" })));
     else footer.append(element("span", "", "已加载全部话题"));
     scheduleRecovery();
@@ -307,10 +315,12 @@
   function scheduleRecovery() {
     clearTimeout(recoveryTimer);
     if (!state.onScreen || !((state.listError && state.listRetryAt > Date.now()) ||
+        (state.topicError && state.topicRetryAt > Date.now()) ||
         (state.detail?.moreError && state.detail.retryAt > Date.now()) ||
         (state.detail?.liveStatus?.error && state.detail.liveStatus.retryAt > Date.now()))) return;
     recoveryTimer = setTimeout(() => {
       renderListFooter();
+      if (state.topicError && !state.detail) renderReading();
       if (state.detail?.moreError) renderReplies();
       renderLiveStatus();
       scheduleRecovery();
@@ -325,13 +335,15 @@
     rows.replaceChildren(...state.rows.map(topicRow));
     renderListFooter();
     scroll.scrollTop = position;
+    listPager?.captureScrollPosition();
     if (focusedTopic) $(`.topic-select[data-value="${focusedTopic}"]`)?.focus({ preventScroll: true });
     updateSteps();
     listPager?.check();
   }
 
-  async function loadList(append = false, keepTopic = false) {
+  async function loadList(append = false, keepTopic = false, { background = false } = {}) {
     if (append && (!state.next || state.listBusy || state.listRetryAt > Date.now())) return;
+    if (append && !background) listPager?.consumeAutoBudget();
     const previousCount = append ? state.rows.length : 0;
     if (!append) {
       state.listGeneration++;
@@ -353,7 +365,7 @@
     renderList();
     try {
       if (privateModes.has(state.view) && state.user === null) throw new Error("请先登录 Linux.do。");
-      const data = await forum.feed(path, controller.signal);
+      const data = await forum.feed(path, controller.signal, { background });
       if (controller.signal.aborted) return;
       const unique = new Map((append ? state.rows : []).map(row => [row.id, row]));
       for (const row of data.rows) unique.set(row.id, row);
@@ -386,6 +398,7 @@
     state.detail?.live?.stop();
     topicRequest?.abort();
     state.selected = null;
+    state.topicBusy = false;
     state.detail = null;
     resetReplyPager(null);
     $(".shell").dataset.reading = "false";
@@ -405,15 +418,17 @@
   async function selectTopic(topic, activate = true, initialFloor) {
     if (activate) openTopicInView();
     closeMenu();
-    if (state.selected?.id === topic.id && state.detail) return;
+    if (state.selected?.id === topic.id && (state.detail || state.topicBusy)) return;
     state.detail?.live?.stop();
     topicRequest?.abort();
     const controller = new AbortController();
     topicRequest = controller;
     state.selected = topic;
+    state.topicBusy = true;
     state.detail = null;
     resetReplyPager(null);
     state.topicError = null;
+    state.topicRetryAt = 0;
     renderList();
     $("#read-scroll").scrollTop = 0;
     renderReading();
@@ -434,7 +449,11 @@
     } catch (error) {
       if (controller.signal.aborted) return;
       state.topicError = error.message;
+      state.topicRetryAt = Number.isFinite(error.retryAt) ? error.retryAt : 0;
       renderReading();
+      scheduleRecovery();
+    } finally {
+      if (topicRequest === controller) state.topicBusy = false;
     }
   }
 
@@ -488,6 +507,7 @@
     const replacement = floor && $(`[data-post-number="${floor}"]`);
     if (replacement) viewport.scrollTop += replacement.getBoundingClientRect().top - offset;
     else viewport.scrollTop = position;
+    replyPager?.captureScrollPosition();
   }
 
   function renderLiveStatus() {
@@ -500,22 +520,38 @@
     if (!detail) return;
     const live = detail.liveStatus || { phase: "connecting", users: [], count: 0 };
     const seconds = Math.max(0, Math.ceil(((live.retryAt || 0) - Date.now()) / 1000));
-    const message = live.error ? (seconds ? `原站限流，实时更新已暂停 · ${seconds} 秒后可重试` : `实时更新已暂停 · ${live.error}`)
+    const message = live.error ? `实时更新已暂停 · ${recoveryMessage(live.error, live.retryAt)}`
       : live.phase === "connecting" ? "正在连接原版实时消息…"
-      : live.pending ? `等待更新 ${live.pending} 条回复` : live.busy ? "正在同步实时状态…" : "原版消息通道 · 新回复自动更新";
+      : live.pending ? `等待更新 ${live.pending} 条回复` : live.busy && !live.presenceBusy ? "正在同步实时状态…" : "原版消息通道 · 新回复自动更新";
     bar.append(element("span", live.error ? "live-message error" : "live-message", message));
-    if (live.presenceError) bar.append(element("span", "live-presence muted", live.presenceError));
-    else if (live.presenceUnavailable) bar.append(element("span", "live-presence muted", "原站未提供正在回复状态。"));
-    else if (live.count > 0) {
-      const typing = element("span", "live-presence");
+    const typing = element("span", "live-presence");
+    typing.setAttribute("aria-label", "正在回复状态");
+    if (live.presenceBusy) {
+      typing.classList.add("muted");
+      typing.append("正在同步正在回复状态…");
+    } else if (live.presenceError || live.presenceUnavailable) {
+      typing.classList.add("muted");
+      typing.append(live.presenceError || "原站未提供正在回复状态。");
+    } else if (live.presenceReady && live.count > 0) {
       for (const user of (live.users || []).slice(0, 5)) typing.append(avatar(user, 20));
-      const names = (live.users || []).slice(0, 3).map(user => user.username).filter(Boolean).join("、");
+      const names = (live.users || []).slice(0, 3).map(user => user.display_username || user.username).filter(Boolean).join("、");
       typing.append(element("span", "", names ? `${names}${live.count > 3 ? ` 等 ${live.count} 人` : ""}正在回复…` : `${live.count} 人正在回复…`));
-      bar.append(typing);
+    } else {
+      typing.classList.add("muted");
+      typing.append(live.presenceReady ? "暂无其他人正在回复" : "正在回复状态尚未同步");
     }
+    bar.append(typing);
     const retry = button(live.error ? "重试实时更新" : "更新回复", "refresh-posts", { className: "text-button", symbol: "refresh" });
     retry.disabled = seconds > 0 || live.busy || live.phase === "connecting";
+    const requests = button("请求记录", "menu", { value: "requests", className: "text-button" });
+    requests.setAttribute("aria-expanded", "false");
     bar.append(retry);
+    if (live.presenceError && !live.presenceUnavailable) {
+      const presenceRetry = button("重试正在回复状态", "refresh-presence", { className: "text-button", symbol: "refresh" });
+      presenceRetry.disabled = seconds > 0 || live.busy || live.phase === "connecting" || !!live.error;
+      bar.append(presenceRetry);
+    }
+    bar.append(requests);
   }
 
   function canReply(detail) {
@@ -554,14 +590,14 @@
       const topic = Object.fromEntries(["id", "title", "fancy_title", "slug", "category_id", "closed", "archived", "archetype", "draft_key", "draft_sequence", "posts_count", "highest_post_number"]
         .map(key => [key, data[key]]));
       topic.details = { can_create_post: data.details?.can_create_post };
-      const target = post && Object.fromEntries(["id", "post_number", "topic_id", "username", "display_username", "name", "avatar_template"].map(key => [key, post[key]]));
+      const target = post && Object.fromEntries(["id", "post_number", "topic_id", "user_id", "post_type", "username", "display_username", "name", "avatar_template"].map(key => [key, post[key]]));
       const result = await getNativeClient().reply(topic, target);
       if (result?.opened === false && !result.login && state.detail === detail) notify("原站编辑器尚未打开，请重试或在原站回复。");
     } catch (error) {
       if (error.status === 429 || [502, 503, 504].includes(error.status) && (error.retryAfter != null || error.retryAt != null)) {
         const delay = Number.isFinite(error.retryAt) ? Math.max(0, error.retryAt - Date.now())
           : Number.isFinite(error.retryAfter) ? Math.max(0, error.retryAfter) : 5000;
-        forum.requestQueue.defer(delay);
+        forum.requestQueue.defer(delay, { source: error.requestSource === "composer" ? "composer" : "draft", status: error.status });
         if (state.detail === detail) detail.live?.pause(forum.requestQueue.busyError());
         scheduleRecovery();
       }
@@ -621,7 +657,9 @@
     toolbar.append(anchor("在 Linux.do 打开", forum.topicPath(detail?.data || selected), "original", "out"));
     if (selected.hit?.post_number > 1) toolbar.prepend(anchor("查看命中楼层", forum.topicPath(selected, selected.hit.post_number), "original", "search"));
     if (!detail) {
-      content.append(state.topicError ? status(state.topicError, "retry-topic") : status("正在读取话题…"));
+      const message = state.topicError ? status(recoveryMessage(state.topicError, state.topicRetryAt), "retry-topic") : status("正在读取话题…");
+      if (state.topicError) message.querySelector("button").disabled = state.topicRetryAt > Date.now();
+      content.append(message);
       return;
     }
 
@@ -696,9 +734,6 @@
     }
     sortSelect.value = ["oldest", "newest", "top"].includes(detail.sort) ? detail.sort : "oldest";
     tools.append(sortLabel, sortSelect);
-    if (loaded) tools.append(
-      button("展开全部", "expand-all", { className: "text-button" }),
-      button("折叠分支", "collapse-all", { className: "text-button" }));
     heading.append(tools);
     const sortNote = element("p", "reply-sort-note", "排序仅基于已加载回复；各分支的同级回复分别排序。");
     sortNote.id = "reply-sort-note";
@@ -761,19 +796,20 @@
     const retrySeconds = Math.max(0, Math.ceil(((detail.retryAt || 0) - Date.now()) / 1000));
     const footer = add(element("div", "reply-footer"), element("span", "", `已载入 ${loaded} / ${Math.max(total, loaded)} 条回复`));
     if (paused) footer.append(element("span", "paging-paused", "自动加载已暂停：未取得高度进展或遇到重复游标，可手动继续。"));
-    else if (pending && !detail.moreError && !retrySeconds) footer.append(element("span", "", "滚动到底部自动加载"));
+    else if (pending && !detail.moreError && !retrySeconds) footer.append(element("span", "", "继续滚动或手动加载，每次至多一页"));
     if (pending || detail.moreError || paused || detail.moreBusy || retrySeconds) {
       const more = button(detail.moreBusy ? "正在加载…" : retrySeconds ? `${retrySeconds} 秒后重试` : detail.moreError ? "重试" : "手动加载更多",
         "more-posts", { className: "secondary-button", symbol: "down" });
       more.disabled = !!detail.moreBusy || retrySeconds > 0;
       footer.append(more);
     }
-    if (detail.moreError) footer.append(element("span", "error", detail.moreError));
+    if (detail.moreError) footer.append(element("span", "error", recoveryMessage(detail.moreError, detail.retryAt)));
     section.append(footer);
     if (anchorFloor) {
       const replacement = section.querySelector(`[data-reply-floor="${anchorFloor}"]`);
       if (replacement) viewport.scrollTop += replacement.getBoundingClientRect().top - anchorTop;
     }
+    replyPager?.captureScrollPosition();
     if (restoreSortFocus) sortSelect.focus({ preventScroll: true });
     replyPager?.check();
   }
@@ -788,10 +824,11 @@
     if (!detail) return;
     replyPager = new globalThis.LDScroll.Pager({
       viewport: $("#read-scroll"),
+      autoLoadLimit: 1,
       canLoad: () => state.onScreen && state.detail === detail && !detail.moreBusy && !detail.live?.busy && !detail.moreError && pendingPostIds(detail).length > 0,
       getKey: () => `${detail.data.id}:${pendingPostIds(detail)[0]}`,
       getSentinel: () => $("#reply-section .reply-footer"),
-      load: loadReplies,
+      load: () => loadReplies({ background: true }),
       onStateChange: paging => {
         detail.paging = paging;
         // Only a safety pause needs another tree render; loading/error states
@@ -801,19 +838,20 @@
     });
   }
 
-  async function loadReplies() {
+  async function loadReplies({ background = false } = {}) {
     const detail = state.detail;
     if (!detail || detail.moreBusy || detail.live?.busy || detail.retryAt > Date.now()) return;
     const previousCount = detail.posts.size;
     const ids = pendingPostIds(detail).slice(0, Math.min(detail.data.chunk_size || 20, 30));
     if (!ids.length) return;
+    if (!background) replyPager?.consumeAutoBudget();
     detail.loadingIds = new Set(ids);
     detail.moreBusy = true;
     detail.moreError = null;
     detail.retryAt = 0;
     renderReplies();
     try {
-      const posts = await forum.postsPage(detail.data.id, ids, detail.controller.signal);
+      const posts = await forum.postsPage(detail.data.id, ids, detail.controller.signal, { background });
       if (detail.controller.signal.aborted || state.detail !== detail) return;
       for (const id of ids) detail.attempted.add(id);
       for (const post of posts) {
@@ -1010,6 +1048,21 @@
       input.addEventListener("input", fill);
       popupSection(menu, null, [[isCategory ? "原站类别目录" : "原站标签目录", isCategory ? "/categories" : "/tags"]]);
     }
+    if (name === "requests") {
+      menu.append(element("h3", "popup-label", "最近 10 次阅读器请求"));
+      menu.append(element("p", "popup-empty", "仅本页内存记录，不含网址或正文；不涵盖原站自身请求，也不能证明是哪次操作累积触发限流。"));
+      const records = forum.requestQueue.diagnostics?.() || [];
+      if (!records.length) menu.append(element("p", "popup-empty", "本页暂无阅读器请求记录。"));
+      const timeFormat = new Intl.DateTimeFormat("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23" });
+      for (const record of [...records].reverse()) {
+        const timestamp = Number.isFinite(record.startedAt) ? timeFormat.format(record.startedAt) : "时间未知";
+        const nativeFailure = ["原版草稿读取", "原版编辑器"].includes(record.requestSource);
+        const result = record.completedAt == null ? "进行中" : record.status === 0 ? "网络失败或取消" : `结果码 ${record.status}`;
+        menu.append(add(element("div", "request-record"), element("strong", "", record.requestSource),
+          element("span", "muted", `${nativeFailure ? "收到失败 " : ""}${timestamp} · ${record.background ? "后台" : "前台"}${nativeFailure ? "" : ` ${record.method}`} · ${result}`)));
+      }
+      menu.append(button("关闭记录", "close-menu", { className: "popup-item" }));
+    }
     if (name === "notification") {
       menu.append(element("h3", "popup-label", "话题通知"));
       for (const [value, label] of levels) {
@@ -1126,7 +1179,7 @@
     const inMenu = event.target.closest("#menu");
     const action = control?.dataset.action;
     const value = control?.dataset.value;
-    if (!inMenu && action !== "menu") closeMenu();
+    if (!inMenu && action !== "menu" && action !== "close-menu") closeMenu();
     if (action !== "sidebar") closeSidebar();
     if (!control) return;
     switch (action) {
@@ -1134,6 +1187,7 @@
       case "category": switchFeed("latest", state.categories.get(Number(value)) || null, state.tag); break;
       case "tag": switchFeed("latest", state.category, control._readerTag || null); break;
       case "menu": openMenu(value, control); break;
+      case "close-menu": closeMenu(true); break;
       case "sidebar": openSidebar(control); break;
       case "filter-section": {
         state.openMenu.name = value;
@@ -1167,6 +1221,9 @@
       case "more-topics": listPager?.resume(); loadList(true).catch(() => {}); break;
       case "retry-topic": selectTopic(state.selected); break;
       case "reply": void replyTo(Number(value)); break;
+      case "refresh-presence":
+        state.detail?.live?.refreshPresence();
+        break;
       case "refresh-posts":
         if (state.detail?.live) state.detail.live.refresh();
         else if (state.detail) startTopicLive(state.detail);
@@ -1184,13 +1241,6 @@
         $(`.branch-toggle[data-value="${floor}"]`)?.focus({ preventScroll: true });
         break;
       }
-      case "expand-all": state.detail.collapsed.clear(); renderReplies(); break;
-      case "collapse-all":
-        for (const post of state.detail.posts.values()) {
-          if (post.reply_to_post_number > 1) state.detail.collapsed.add(post.reply_to_post_number);
-        }
-        renderReplies();
-        break;
     }
   }
 
@@ -1461,6 +1511,7 @@
     modeSwitch.append(controls);
     updateMode();
     headerObserver = new ResizeObserver(sizeReader);
+    if (requestedAtStart || requestedURL()) openFromURL();
     syncNativeLayout();
     new MutationObserver(syncNativeLayout).observe(document.body, { childList: true, subtree: true });
     window.addEventListener("resize", sizeReader);
@@ -1482,8 +1533,7 @@
     document.addEventListener("keydown", event => {
       if (event.key === "Escape" && !event.defaultPrevented && state.sidebarMenu && !event.target.closest?.(".fk-d-menu, .d-modal")) closeSidebar(true);
     });
-    if (requestedAtStart || requestedURL()) openFromURL();
-    else if (navigation.readerRoute(location.pathname)) showReader();
+    if (navigation.readerRoute(location.pathname)) showReader();
     window.addEventListener("pagehide", () => hideReader(false, true));
     window.addEventListener("pageshow", syncNativeLayout);
     document.addEventListener("visibilitychange", () => state.detail?.live?.visibilityChanged());

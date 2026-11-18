@@ -356,17 +356,21 @@
     }
     if (target?.deleted_at || target?.user_deleted || target?.hidden) throw new NativeError("POST_UNAVAILABLE", "该楼层已删除或隐藏，请回复话题而非该楼层。");
     const epoch = routeEpoch;
-    requestToken.topicId = input.id;
+    // Discourse's cached-record hydration consumes attrs in place, including
+    // deleting unchanged draft_key/draft_sequence. Never read request identity
+    // back from the object given to store.createRecord().
+    const topicId = input.id, draftKey = input.draft_key, draftSequence = input.draft_sequence;
+    requestToken.topicId = topicId;
     const ensureCurrent = () => {
       if (!home() || epoch !== routeEpoch) throw new NativeError("LEFT_HOMEPAGE", "已离开首页，取消阅读器回复会话。");
       if (requestToken.cancelled) throw new NativeError("REPLY_CANCELLED", "已关闭或切换阅读区，取消打开原版编辑器。");
     };
     ensureCurrent();
-    const topic = store.createRecord("topic", input);
+    const topic = store.createRecord("topic", { ...input, details: { ...input.details } });
     if (get(topic, "details.can_create_post") !== true) throw new NativeError("REPLY_FORBIDDEN", "原站不允许当前账号回复该话题。");
     if (input.post_stream && typeof get(topic, "postStream")?.updateFromJson === "function") get(topic, "postStream").updateFromJson(input.post_stream);
     const targetPost = target && target.post_number > 1 ? store.createRecord("post", { ...pick(target, ["id", "topic_id", "post_number", "username", "name", "display_username", "user_id", "avatar_template", "post_type", "reply_to_post_number"]), topic }) : null;
-    const opts = { action: Composer.REPLY, topic, draftKey: input.draft_key, draftSequence: input.draft_sequence, skipJumpOnSave: true };
+    const opts = { action: Composer.REPLY, topic, draftKey, draftSequence, skipJumpOnSave: true };
     if (targetPost) opts.post = targetPost;
     attachEvents(container);
     eventService?.trigger("page:compose-reply", topic);
@@ -374,9 +378,23 @@
     // Match the native reply action: a persisted draft must be restored before
     // open; a malformed or unrecognized draft is never cleared automatically.
     const model = composer.model;
-    const sameReply = get(model, "topic.id") === input.id && get(model, "action") === Composer.REPLY && get(model, "draftKey") === input.draft_key;
+    const sameReply = get(model, "topic.id") === topicId && get(model, "action") === Composer.REPLY && get(model, "draftKey") === draftKey;
     if (sameReply && typeof model?.setProperties === "function") {
-      model.setProperties({ post: targetPost, composeState: Composer.OPEN });
+      // Closing and collapsing are different native lifecycles: close() clears
+      // model; collapse() keeps it in DRAFT at 40px. The site's reopen action
+      // restores the saved height without reloading/replacing the unsaved body.
+      if (get(model, "composeState") === Composer.DRAFT) {
+        if (typeof composer.openIfDraft !== "function") throw new NativeError("COMPOSER_UNSUPPORTED", "原版草稿暂不能安全展开，请在原版页面继续回复。");
+        composer.openIfDraft();
+      } else if (![Composer.OPEN, Composer.FULLSCREEN].filter(Boolean).includes(get(model, "composeState"))) {
+        throw new NativeError("COMPOSER_BUSY", "原版编辑器状态正在变化，请稍候再回复。");
+      }
+      ensureCurrent();
+      if (composer.model !== model) throw new NativeError("COMPOSER_BUSY", "原版编辑器已切换，请重新选择回复。");
+      model.setProperties({ post: targetPost });
+      // New Discourse models store reply_to_* independently from post; changing
+      // only post leaves the outgoing reply aimed at the previous floor.
+      if (typeof model.setReplyTo === "function") model.setReplyTo(targetPost?.post_number, targetPost && { ...pick(targetPost, ["username", "name", "avatar_template"]), id: get(targetPost, "user_id") });
       if (typeof composer.set === "function") composer.set("skipJumpOnSave", true);
       else composer.skipJumpOnSave = true;
     } else {
@@ -393,15 +411,21 @@
         if (typeof data.whisper === "boolean") opts.whisper = data.whisper;
         if (typeof Composer.isEditDraft === "function" && Composer.isEditDraft(data)) opts.draft = data;
         else if (data.action && data.action !== Composer.REPLY) throw new NativeError("DRAFT_CONFLICT", "已有其它操作的原版草稿，请先在原版处理。");
+        else {
+          // Native loadDraft restores all registered fields, including reply
+          // target, typing time and plugin metadata. Body-only restoration
+          // would overwrite those fields on the next native autosave.
+          opts.draft = { ...data, action: Composer.REPLY };
+        }
       }
       requestToken.phase = "composer";
       await composer.open(opts); // The original service owns discard/dirty-draft confirmations.
     }
     ensureCurrent();
-    const opened = get(composer.model, "topic.id") === input.id && get(composer.model, "composeState") === Composer.OPEN;
+    const opened = get(composer.model, "topic.id") === topicId && [Composer.OPEN, Composer.FULLSCREEN].filter(Boolean).includes(get(composer.model, "composeState"));
     if (opened) {
       guardSave(composer, composer.model, clientId);
-      replySession = { clientId, topicId: input.id, postId: get(composer.model, "post.id"), epoch };
+      replySession = { clientId, topicId, postId: get(composer.model, "post.id"), epoch };
     }
     return { opened };
   }
@@ -411,7 +435,7 @@
     const data = event.data;
     if (!data || data.type !== requestType || !token(data.clientId)) return;
     if (data.action !== "unwatch" && data.action !== "dispose" && !identifier(data.requestId)) return;
-    let result;
+    let result, replyPhase;
     try {
       // Cleanup actions remain valid after navigation; every other action is
       // strictly the exact homepage, including /topic, /t and /latest exclusions.
@@ -428,6 +452,7 @@
           pendingReplies.set(data.clientId, token);
           try { result = await reply(data.clientId, data.payload, token); }
           finally {
+            replyPhase = token.phase;
             if (pendingReplies.get(data.clientId) === token) pendingReplies.delete(data.clientId);
             if (openingToken === token) openingToken = null;
           }
@@ -440,7 +465,10 @@
       const statusValue = error?.status ?? error?.jqXHR?.status;
       const status = Number.isInteger(statusValue) && statusValue >= 400 && statusValue <= 599 ? statusValue : undefined;
       const failure = error instanceof NativeError ? { code: error.code, message: error.message } : { code: "NATIVE_UNAVAILABLE", message: status === 429 ? "原站限流，已停止打开编辑器，请稍后手动重试。" : "原站编辑器暂不可用，请手动重试或使用原版页面。" };
-      if (status) failure.status = status;
+      if (status) {
+        failure.status = status;
+        if (data.action === "reply") failure.requestSource = replyPhase === "draft" ? "draft" : "composer";
+      }
       if (status === 429 || [502, 503, 504].includes(status)) {
         // Read the already received native AJAX headers. No retry, timer or
         // separate request is introduced; the isolated queue owns the cooldown.

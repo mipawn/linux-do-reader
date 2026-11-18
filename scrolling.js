@@ -3,17 +3,18 @@
 (() => {
   class Pager {
     constructor({ viewport, canLoad, getKey, load, getSentinel, onStateChange,
-      threshold = 300, noProgressLimit = 3, now = () => Date.now() } = {}) {
+      threshold = 300, noProgressLimit = 3, autoLoadLimit = Infinity, now = () => Date.now() } = {}) {
       if (!viewport?.addEventListener || !viewport?.getBoundingClientRect ||
           [canLoad, getKey, load].some(callback => typeof callback !== "function")) {
         throw new TypeError("Pager requires a viewport and canLoad/getKey/load callbacks.");
       }
       if (!Number.isFinite(threshold) || threshold < 0 || !Number.isSafeInteger(noProgressLimit) || noProgressLimit < 1 ||
           getSentinel != null && typeof getSentinel !== "function" ||
+          !(autoLoadLimit === Infinity || Number.isSafeInteger(autoLoadLimit) && autoLoadLimit >= 1) ||
           onStateChange != null && typeof onStateChange !== "function" || typeof now !== "function") {
         throw new TypeError("Pager requires valid callbacks, threshold and noProgressLimit.");
       }
-      Object.assign(this, { viewport, canLoad, getKey, load, getSentinel, onStateChange, threshold, noProgressLimit, now });
+      Object.assign(this, { viewport, canLoad, getKey, load, getSentinel, onStateChange, threshold, noProgressLimit, autoLoadLimit, now });
       this.window = viewport.ownerDocument?.defaultView || globalThis.window;
       this.document = viewport.ownerDocument || this.window.document;
       this.frame = null;
@@ -27,7 +28,15 @@
       this.state = { status: "idle", reason: null, error: null, retryAfter: 0, retryAt: 0 };
       this.sentinel = null;
       this.intersecting = false;
+      this.autoLoads = 0;
+      this.captureScrollPosition();
       this.onChange = () => this.check();
+      this.onScroll = () => {
+        const position = Number(this.viewport.scrollTop) || 0;
+        if (Math.abs(position - this.scrollPosition) >= 1) this.autoLoads = 0;
+        this.scrollPosition = position;
+        this.check();
+      };
       this.onOnline = () => {
         // One online transition may recover a transient failure. Repeated online
         // events cannot become an unbounded error/retry loop.
@@ -37,7 +46,7 @@
           this.recover(false);
         }
       };
-      viewport.addEventListener("scroll", this.onChange, { passive: true });
+      viewport.addEventListener("scroll", this.onScroll, { passive: true });
       this.window.addEventListener("resize", this.onChange);
       this.window.addEventListener("online", this.onOnline);
       this.document?.addEventListener("visibilitychange", this.onChange);
@@ -68,6 +77,11 @@
       }
       this.check();
     }
+
+    // Layout/anchor restoration is not a new request to keep reading. Callers
+    // synchronize the position before its asynchronous scroll event is delivered.
+    captureScrollPosition() { this.scrollPosition = Number(this.viewport.scrollTop) || 0; }
+    consumeAutoBudget() { this.autoLoads++; }
 
     // Coalesce observer, scroll, resize and explicit render notifications.
     check() {
@@ -154,7 +168,12 @@
         this.setState("paused", { reason: "duplicate-cursor" });
         return;
       }
+      if (this.autoLoads >= this.autoLoadLimit) {
+        this.setState("idle", { reason: "await-scroll" });
+        return;
+      }
       const token = { key, epoch: this.epoch, height: this.viewport.scrollHeight };
+      this.consumeAutoBudget();
       this.pending = token;
       this.setState("loading");
       try {
@@ -201,6 +220,8 @@
 
     recover(manual = true) {
       if (this.destroyed || this.pending || this.state.retryAt > this.now()) return false;
+      this.autoLoads = 0;
+      this.captureScrollPosition();
       this.attempted.clear();
       this.paused = false;
       this.noProgress = 0;
@@ -218,6 +239,8 @@
     reset() {
       if (this.destroyed) return;
       this.epoch++;
+      this.autoLoads = 0;
+      this.captureScrollPosition();
       this.attempted.clear();
       this.paused = false;
       this.noProgress = 0;
@@ -237,7 +260,7 @@
       this.observer?.disconnect();
       this.mutations?.disconnect();
       this.resizes?.disconnect();
-      this.viewport.removeEventListener("scroll", this.onChange);
+      this.viewport.removeEventListener("scroll", this.onScroll);
       this.window.removeEventListener("resize", this.onChange);
       this.window.removeEventListener("online", this.onOnline);
       this.document?.removeEventListener("visibilitychange", this.onChange);

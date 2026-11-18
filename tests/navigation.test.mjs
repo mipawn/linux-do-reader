@@ -24,6 +24,26 @@ test("only the exact homepage pathname can authorize the reader", () => {
   ]) assert.equal(readerRoute(path), false, String(path));
 });
 
+test("extension launcher flags never reach a feed request while native filters remain", () => {
+  const { feedRoute } = navigationFixture();
+  assert.equal(feedRoute("/", "?ld-reader=1&order=created&ld-reader=0").path, "/latest.json?order=created");
+});
+
+test("automatic list pages pass background policy instead of enabling transient retries", async () => {
+  const f = readerFixture(() => ({ rows: [{ id: 1 }], tags: [], next: "/latest.json?page=1" }));
+  await f.loadList(); await f.loadList(true, false, { background: true });
+  assert.equal(f.calls[0][2].background, false); assert.equal(f.calls[1][2].background, true);
+  assert.match(source("reader.js"), /load: \(\) => loadList\(true, false, \{ background: true \}\)/);
+});
+
+test("launcher normalization before first mount avoids Navigation API duplicate list requests", () => {
+  const f = readerLifecycleFixture("https://linux.do/?ld-reader=1&order=created#ld-reader");
+  f.api.initialize();
+  assert.equal(f.calls.list, 1); assert.deepEqual(f.calls.listPaths, ["/latest.json?order=created"]);
+  assert.equal(f.href, "https://linux.do/?order=created");
+  assert.equal(f.calls.history.length, 1); assert.equal(f.calls.requests, 0);
+});
+
 test("native category, tag and top period routes retain their feed", () => {
   const { feedRoute } = navigationFixture();
   assert.deepEqual(plain(feedRoute("/c/resource/cloud-asset/94", "?tags=foo")), { view: "latest", path: "/c/resource/cloud-asset/94.json?tags=foo", categoryId: 94, categorySlug: "cloud-asset" });
@@ -57,7 +77,7 @@ function backgroundFixture({ response = { open: true }, sendError = null } = {})
   return { click, messages, created };
 }
 
-const readerStartURL = "https://linux.do/?ld-reader=1";
+const readerStartURL = "https://linux.do/";
 
 test("extension action opens the current reader only on the HTTPS homepage", async () => {
   for (const url of ["https://linux.do/", "https://linux.do", "https://linux.do/?ld-reader=1", "https://linux.do/?foo=bar#ld-reader"]) {
@@ -241,7 +261,7 @@ function lifecycleNode(connected = false) {
 }
 
 function readerLifecycleFixture(url) {
-  const calls = { mount: 0, list: 0, context: 0, requests: 0, history: [], intervals: 0, aborts: [] };
+  const calls = { mount: 0, list: 0, context: 0, requests: 0, history: [], listPaths: [], intervals: 0, aborts: [] };
   const header = lifecycleNode(true), outlet = lifecycleNode(true), host = lifecycleNode(), shell = lifecycleNode(), menu = lifecycleNode();
   const logoSource = lifecycleNode(true);
   const originalMedia = "(prefers-color-scheme: dark)";
@@ -257,10 +277,11 @@ function readerLifecycleFixture(url) {
     getElementById: id => id === "main-outlet" ? outlet : null
   };
   let onMessage;
+  const entryChanges = new Set();
   const context = vm.createContext({
     URL, URLSearchParams, Intl, AbortController, performance: { now: () => 0 }, location: new URL(url), document,
-    history: { state: null, replaceState(state, title, target) { calls.history.push(String(target)); context.location = new URL(target, context.location.href); } },
-    window: { innerHeight: 900, scrollX: 0, scrollY: 0, scrollTo() {}, addEventListener() {}, navigation: { addEventListener() {} } },
+    history: { state: null, replaceState(state, title, target) { calls.history.push(String(target)); context.location = new URL(target, context.location.href); for (const listener of entryChanges) listener(); } },
+    window: { innerHeight: 900, scrollX: 0, scrollY: 0, scrollTo() {}, addEventListener() {}, navigation: { addEventListener(type, listener) { if (type === "currententrychange") entryChanges.add(listener); } } },
     ResizeObserver: class { observe() {} disconnect() {} }, MutationObserver: class { observe() {} disconnect() {} },
     setInterval() { calls.intervals++; return 1; }, setTimeout: () => 1, clearTimeout() {},
     chrome: { runtime: { onMessage: { addListener(listener) { onMessage = listener; } } } },
@@ -275,7 +296,7 @@ function readerLifecycleFixture(url) {
     renderFilters = renderList = renderReading = renderListFooter = () => {};
     resetReplyPager = () => {};
     loadContext = () => { lifecycleFixture.calls.context++; };
-    loadList = async () => { lifecycleFixture.calls.list++; };
+    loadList = async () => { lifecycleFixture.calls.list++; lifecycleFixture.calls.listPaths.push(state.initialFeedPath); };
     globalThis.testLifecycle = {
       state, initialize, showReader, requestedURL, openFromURL, syncNativeLayout, applyNativeNavigation,
       get host() { return host; }, get modeSwitch() { return modeSwitch; }, get pendingOpen() { return pendingOpen; },

@@ -61,7 +61,7 @@ function fixture({ observers = false, failObserver = false } = {}) {
     const current = [...frames];
     for (const [id, callback] of current) { frames.delete(id); callback(); }
   };
-  const make = ({ load, key = "next-1", threshold = 300, noProgressLimit = 3, getSentinel, onStateChange } = {}) => {
+  const make = ({ load, key = "next-1", threshold = 300, noProgressLimit = 3, autoLoadLimit = Infinity, getSentinel, onStateChange } = {}) => {
     const state = { key, enabled: true }, viewport = new Events(), calls = [], states = [];
     Object.assign(viewport, {
       ownerDocument: document, hidden: false, isConnected: true,
@@ -72,7 +72,7 @@ function fixture({ observers = false, failObserver = false } = {}) {
     });
     const pager = new context.LDScroll.Pager({
       viewport, canLoad: () => state.enabled, getKey: () => state.key,
-      load: () => { calls.push(state.key); return load?.(state, viewport); }, threshold, noProgressLimit, getSentinel,
+      load: () => { calls.push(state.key); return load?.(state, viewport); }, threshold, noProgressLimit, autoLoadLimit, getSentinel,
       now: () => clock, onStateChange: value => { states.push(value); onStateChange?.(value); }
     });
     return { pager, state, viewport, calls, states };
@@ -318,6 +318,56 @@ test("advancing cursors without height growth use a finite visible budget and ma
   assert.equal(page.pager.resume(), true);
   f.frame(); await drain(f);
   assert.equal(page.calls.length, 6);
+});
+
+test("reader auto quota stops healthy short-page filling until another position change", async () => {
+  const f = fixture(), page = f.make({ autoLoadLimit: 1, load: (state, viewport) => {
+    state.key += "-next"; viewport.scrollHeight += 10; return { progress: true };
+  } });
+  page.viewport.scrollHeight = 200;
+  f.frame(); await drain(f, 20);
+  assert.equal(page.calls.length, 1); assert.equal(page.pager.state.reason, "await-scroll");
+  for (let i = 0; i < 5; i++) { page.pager.check(); f.window.emit("resize"); page.viewport.emit("scroll"); f.frame(); await drain(f); }
+  assert.equal(page.calls.length, 1);
+  page.viewport.scrollTop += 5; page.viewport.emit("scroll"); f.frame(); await drain(f);
+  assert.equal(page.calls.length, 2);
+});
+
+test("anchor compensation and its queued scroll event do not renew the reader auto quota", async () => {
+  const f = fixture(); let page;
+  page = f.make({ autoLoadLimit: 1, load: (state, viewport) => {
+    state.key += "-next"; viewport.scrollHeight += 200; viewport.scrollTop += 200;
+    page.pager.captureScrollPosition();
+    return { progress: true };
+  } });
+  page.viewport.scrollHeight = 200;
+  f.frame(); await drain(f);
+  page.viewport.emit("scroll"); f.frame(); await drain(f, 20);
+  assert.equal(page.calls.length, 1);
+  page.viewport.scrollTop += 5; page.viewport.emit("scroll"); f.frame(); await drain(f);
+  assert.equal(page.calls.length, 2);
+});
+
+test("layout synchronization preserves a scroll credit earned while a page is pending", async () => {
+  const f = fixture(), pending = deferred();
+  const page = f.make({ autoLoadLimit: 1, load: state => {
+    state.key += "-next";
+    if (page.calls.length === 1) return pending.promise;
+    state.enabled = false;
+  } });
+  f.frame(); page.viewport.scrollTop += 5; page.viewport.emit("scroll"); f.frame();
+  assert.equal(page.calls.length, 1);
+  page.viewport.scrollTop += 200; page.pager.captureScrollPosition();
+  pending.resolve({ progress: true }); await drain(f);
+  assert.equal(page.calls.length, 2);
+});
+
+test("explicit page loads consume the reader automatic quota instead of fetching another page", async () => {
+  const f = fixture(), page = f.make({ autoLoadLimit: 1 });
+  page.pager.consumeAutoBudget(); f.frame(); await drain(f);
+  assert.equal(page.calls.length, 0);
+  page.pager.resume(); f.frame(); await drain(f);
+  assert.equal(page.calls.length, 1);
 });
 
 test("a short viewport fills healthy pages beyond two until the actual next page ends", async () => {

@@ -1,5 +1,5 @@
 const openReader = { type: "linux-do-reader:open" };
-const startURL = "https://linux.do/?ld-reader=1";
+const startURL = "https://linux.do/";
 
 function isReaderHomepage(url) {
   try {
