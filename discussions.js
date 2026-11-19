@@ -19,6 +19,95 @@
     return typeof action?.count === "number" && Number.isFinite(action.count) && action.count >= 0 ? action.count : 0;
   }
 
+  function positiveCount(value) {
+    const count = Number(value);
+    return Number.isFinite(count) && count > 0 ? Math.floor(count) : 0;
+  }
+
+  // Reactions are the original site's emoji summary under a post. The server
+  // already orders them by count; re-sorting keeps a stable tie order and the
+  // total falls back to the sum when reaction_users_count is absent, so a
+  // partially serialized post still shows one honest number.
+  function reactionSummary(post) {
+    const reactions = [];
+    const seen = new Set();
+    for (const raw of Array.isArray(post?.reactions) ? post.reactions : []) {
+      const id = typeof raw?.id === "string" ? raw.id.trim() : "";
+      const count = positiveCount(raw?.count);
+      if (!id || !count || seen.has(id)) continue;
+      seen.add(id);
+      reactions.push({ id, count });
+    }
+    reactions.sort((a, b) => b.count - a.count || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+    const total = positiveCount(post?.reaction_users_count) ||
+      reactions.reduce((sum, reaction) => sum + reaction.count, 0) || likeCount(post);
+    if (!reactions.length && total) reactions.push({ id: "heart", count: total });
+    return { reactions, total };
+  }
+
+  // Boosts are the original site's short "表情评论" bubbles: a user avatar plus
+  // sanitized cooked HTML. Keep only entries that can be rendered honestly.
+  function boosts(post) {
+    const result = [];
+    const seen = new Set();
+    for (const raw of Array.isArray(post?.boosts) ? post.boosts : []) {
+      const user = raw?.user;
+      const cooked = typeof raw?.cooked === "string" ? raw.cooked.trim() : "";
+      if (!cooked || !user || typeof user !== "object") continue;
+      const key = Number.isSafeInteger(raw?.id) ? raw.id : null;
+      if (key != null && seen.has(key)) continue;
+      if (key != null) seen.add(key);
+      result.push({
+        id: Number.isSafeInteger(raw?.id) ? raw.id : null,
+        cooked,
+        can_delete: raw?.can_delete === true,
+        user: {
+          id: Number.isSafeInteger(user.id) ? user.id : null,
+          username: typeof user.username === "string" ? user.username : "",
+          name: typeof user.name === "string" ? user.name : "",
+          avatar_template: typeof user.avatar_template === "string" ? user.avatar_template : null
+        }
+      });
+    }
+    return result;
+  }
+
+  // A topic link and its floor variants are the same reference. Comparing the
+  // first numeric segment after /t/ folds /t/slug/123/4 into /t/123.
+  function referenceKey(url) {
+    const raw = typeof url === "string" ? url : "";
+    const path = raw.replace(/^[a-z][a-z0-9+.-]*:\/\/[^/]*/i, "").replace(/[?#].*$/, "");
+    const segments = path.split("/").filter(Boolean);
+    const index = segments.indexOf("t");
+    if (index < 0) return "url:" + raw;
+    for (let cursor = index + 1; cursor < segments.length; cursor++) {
+      if (/^\d+$/.test(segments[cursor])) return "topic:" + segments[cursor];
+    }
+    return "url:" + raw;
+  }
+
+  // Related links are the original site's inbound references ("被以下帖子引用").
+  // Outbound links stay inline in the cooked post, exactly like the original.
+  function relatedLinks(post) {
+    const links = (Array.isArray(post?.link_counts) ? post.link_counts : [])
+      .filter(link => link && link.reflection === true && typeof link.url === "string" && link.url.trim())
+      .map(link => ({
+        url: link.url,
+        clicks: positiveCount(link.clicks),
+        title: typeof link.title === "string" && link.title.trim() ? link.title.trim() : link.url
+      }))
+      .sort((a, b) => b.clicks - a.clicks || (a.url < b.url ? -1 : a.url > b.url ? 1 : 0));
+    const seen = new Set();
+    const result = [];
+    for (const link of links) {
+      const key = referenceKey(link.url);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      result.push(link);
+    }
+    return result;
+  }
+
   function missingParent(floor) {
     if (!Number.isSafeInteger(floor) || floor <= 1) return null;
     // No username, cooked HTML, deletion marker or invented ancestry.
@@ -74,5 +163,7 @@
     return roots;
   }
 
-  globalThis.LDDiscussion = Object.freeze({ replyTree, isDeleted, postState, likeCount, missingParent });
+  globalThis.LDDiscussion = Object.freeze({
+    replyTree, isDeleted, postState, likeCount, missingParent, reactionSummary, boosts, relatedLinks, referenceKey
+  });
 })();

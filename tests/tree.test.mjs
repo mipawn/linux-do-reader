@@ -6,7 +6,7 @@ import vm from "node:vm";
 const source = name => readFileSync(new URL(`../${name}`, import.meta.url), "utf8");
 const context = vm.createContext({});
 vm.runInContext(source("discussions.js"), context);
-const { replyTree, isDeleted, postState, likeCount, missingParent } = context.LDDiscussion;
+const { replyTree, isDeleted, postState, likeCount, missingParent, reactionSummary, boosts, relatedLinks, referenceKey } = context.LDDiscussion;
 const plain = value => JSON.parse(JSON.stringify(value));
 const floors = nodes => Array.from(nodes, node => node.post.post_number);
 const post = (floor, parent, likes = 0) => ({
@@ -141,6 +141,65 @@ test("deep trees are built and sorted iteratively without call-stack overflow", 
   let nodes = replyTree(posts, "top"), count = 0;
   while (nodes.length) { assert.equal(nodes.length, 1); count++; nodes = nodes[0].children; }
   assert.equal(count, posts.length);
+});
+
+test("reaction summaries keep positive counts, dedupe ids and use one honest total", () => {
+  assert.deepEqual(plain(reactionSummary({ reactions: [
+    { id: "heart", type: "emoji", count: 59 }, { id: "+1", type: "emoji", count: 2 },
+    { id: "tieba_087", type: "emoji", count: 1 }, { id: "heart", type: "emoji", count: 60 }
+  ], reaction_users_count: 62 })), { reactions: [
+    { id: "heart", count: 59 }, { id: "+1", count: 2 }, { id: "tieba_087", count: 1 }
+  ], total: 62 });
+  // Missing/zero reaction_users_count falls back to the sum of the reactions.
+  assert.deepEqual(plain(reactionSummary({ reactions: [{ id: "heart", count: 4 }, { id: "clap", count: 2 }], reaction_users_count: 0 })),
+    { reactions: [{ id: "heart", count: 4 }, { id: "clap", count: 2 }], total: 6 });
+  // A like-only post without reaction data still surfaces its like count.
+  assert.deepEqual(plain(reactionSummary({ actions_summary: [{ id: 2, count: 8 }] })),
+    { reactions: [{ id: "heart", count: 8 }], total: 8 });
+  for (const value of [null, {}, { reactions: "x" }, { reactions: [null, { id: "", count: 3 }, { id: "x", count: -1 }] }]) {
+    assert.deepEqual(plain(reactionSummary(value)), { reactions: [], total: 0 });
+  }
+  // The caller's order is not trusted: the server sorts by count, equal counts stay stable by id.
+  const sorted = reactionSummary({ reactions: [{ id: "b", count: 1 }, { id: "a", count: 5 }, { id: "c", count: 1 }], reaction_users_count: 7 });
+  assert.deepEqual(plain(sorted.reactions.map(item => item.id)), ["a", "b", "c"]);
+});
+
+test("boost bubbles keep cooked HTML and a renderable user, dropping malformed entries", () => {
+  const list = boosts({ boosts: [
+    { id: 1, cooked: "<p>前排</p>", can_delete: true, user: { id: 7, username: "neo", name: "Neo", avatar_template: "/a/{size}.png" } },
+    { id: 1, cooked: "<p>dup</p>", user: { username: "dup" } },
+    { id: 2, cooked: "  ", user: { username: "empty" } },
+    { id: 3, cooked: "<p>x</p>" },
+    { id: 4, cooked: "<p>y</p>", user: { id: "9", username: "rel", avatar_template: 7 } }
+  ] });
+  assert.deepEqual(plain(list), [
+    { id: 1, cooked: "<p>前排</p>", can_delete: true, user: { id: 7, username: "neo", name: "Neo", avatar_template: "/a/{size}.png" } },
+    { id: 4, cooked: "<p>y</p>", can_delete: false, user: { id: null, username: "rel", name: "", avatar_template: null } }
+  ]);
+  assert.deepEqual(plain(boosts({ boosts: "x" })), []);
+});
+
+test("related links keep only inbound references, fold floor variants and sort by clicks", () => {
+  const post = { link_counts: [
+    { url: "https://github.com/x", internal: false, reflection: false, clicks: 300, title: "outbound" },
+    { url: "https://linux.do/t/topic/11", internal: true, reflection: true, clicks: 5, title: "十一" },
+    { url: "https://linux.do/t/some-slug/22/3", internal: true, reflection: true, clicks: 40, title: "二十二" },
+    { url: "https://linux.do/t/topic/22", internal: true, reflection: true, clicks: 7, title: "二十二" },
+    { url: "https://linux.do/t/topic/33", internal: true, reflection: true, clicks: 0, title: "" }
+  ] };
+  assert.deepEqual(plain(relatedLinks(post)), [
+    { url: "https://linux.do/t/some-slug/22/3", clicks: 40, title: "二十二" },
+    { url: "https://linux.do/t/topic/11", clicks: 5, title: "十一" },
+    { url: "https://linux.do/t/topic/33", clicks: 0, title: "https://linux.do/t/topic/33" }
+  ]);
+  assert.deepEqual(plain(relatedLinks({ link_counts: [] })), []);
+  assert.deepEqual(plain(relatedLinks(null)), []);
+  assert.equal(referenceKey("https://linux.do/t/topic/22"), "topic:22");
+  assert.equal(referenceKey("https://linux.do/t/some-slug/22/3"), "topic:22");
+  assert.equal(referenceKey("/t/22/3"), "topic:22");
+  // Topic-id folding is path based so it also covers /t/ URLs without a slug.
+  assert.equal(referenceKey("https://example.com/t/x/22"), "topic:22");
+  assert.equal(referenceKey("https://example.com/a"), "url:https://example.com/a");
 });
 
 // Exercise only the delegated functions, without booting the extension or a

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "LINUX DO 阅读器",
-  "version": "1.7.4",
+  "version": "1.7.5",
   "description": "仅增强 Linux.do 首页：原地阅读树状讨论，使用原版编辑器回复，显示正在回复并按消息增量更新。",
   "icons": { "32": "icon.png", "128": "icon.png" },
   "action": { "default_title": "打开 LINUX DO 阅读器", "default_icon": "icon.png" },

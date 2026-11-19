@@ -78,7 +78,7 @@ time, .metrics, .reply-count, .floor { font-variant-numeric: tabular-nums; }
 .ic-plus { --i: 8; } .ic-refresh { --i: 9; } .ic-back { --i: 10; } .ic-up { --i: 11; }
 .ic-down { --i: 12; } .ic-out { --i: 13; } .ic-user { --i: 14; } .ic-comment { --i: 15; }
 .ic-eye { --i: 16; } .ic-heart { --i: 17; } .ic-tree { --i: 18; } .ic-minus { --i: 19; }
-.ic-reply { --i: 20; }
+.ic-reply { --i: 20; } .ic-link { --i: 21; } .ic-rocket { --i: 22; }
 
 .shell {
   color: var(--ink);
@@ -192,7 +192,10 @@ time, .metrics, .reply-count, .floor { font-variant-numeric: tabular-nums; }
 .live-presence.muted { color: var(--muted); }
 .live-status .text-button { display: inline-flex; align-items: center; gap: 4px; }
 .live-status [data-action="refresh-posts"] { margin-left: auto; }
-.post-actions { display: flex; justify-content: flex-end; margin-top: 8px; }
+.post-controls { display: flex; align-items: center; gap: 8px; min-height: 40px; margin-top: 8px; }
+.post-actions { display: flex; align-items: center; justify-content: flex-end; gap: 2px; min-height: 40px; margin-left: auto; }
+.post-controls .reply-button { min-height: 40px; margin-left: 4px; padding: 8px 11px; border-color: transparent; background: transparent; color: var(--muted); }
+.post-controls .reply-button:hover:not(:disabled) { border-color: transparent; background: var(--hover); color: var(--accent-text); }
 .reply-button { display: inline-flex; align-items: center; gap: 5px; color: var(--accent-text); background: var(--accent-soft); border: 1px solid var(--border); padding: 5px 8px; border-radius: 6px; font-size: 12px; white-space: nowrap; }
 .reply-button:hover:not(:disabled) { border-color: var(--accent-line); }
 #reading-actions { flex-wrap: wrap; justify-content: flex-end; }
@@ -282,6 +285,70 @@ a.author-name:hover { color: var(--accent-text); text-decoration: underline; }
 .post-content hr { border: 0; border-bottom: 1px solid var(--border); }
 .post-content h1, .post-content h2, .post-content h3 { font-size: 1.22em; margin: 10px 0 5px; }
 .post-content figure { padding: 0; }
+
+/* Original-site extras under a post: emoji reactions, boost bubbles and the
+   inbound "related links" box. Read-only: nothing here writes to the account. */
+.post-reactions { display: flex; flex-wrap: wrap; align-items: center; gap: 3px; min-width: 0; margin: 0; }
+.reaction { display: inline-flex; align-items: center; }
+.reaction-emoji { display: block; width: 16px; height: 16px; max-width: none; }
+.reaction-name { color: var(--muted); font-size: 12px; }
+.reaction-total { margin-left: 6px; color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+.post-boosts { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 10px; }
+.boost { display: inline-flex; align-items: center; gap: 5px; min-width: 0; max-width: min(100%, 320px); padding: 3px 9px 3px 3px; border-radius: 999px; background: var(--hover); color: var(--ink); font-size: 12px; line-height: 1.45; }
+.boost .avatar { flex: 0 0 24px; box-shadow: 0 0 0 1px var(--accent-soft); }
+.boost-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.boost-text :is(p, div) { display: inline; margin: 0; }
+.boost-text img.emoji { width: 1.25em; height: 1.25em; max-width: none; vertical-align: -0.22em; }
+.post-links { margin-top: 13px; padding-top: 11px; border-top: 1px solid var(--border); }
+.post-links-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 2px; }
+.post-link-row { min-width: 0; }
+.post-link { display: flex; align-items: center; gap: 7px; max-width: 100%; padding: 2px 5px; margin-left: -5px; border-radius: 5px; color: var(--muted); font-size: 13px; }
+.post-link:hover { color: var(--accent-text); background: var(--hover); }
+.post-link .ic { --icon-size: 13px; flex: 0 0 13px; opacity: .85; }
+.post-link-title { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.post-link-count { flex: 0 0 auto; padding: 0 6px; border-radius: 9px; background: var(--chip); color: var(--dim); font-size: 11px; line-height: 17px; font-variant-numeric: tabular-nums; }
+.post-links-more { margin-top: 3px; padding: 2px 4px; border-radius: 4px; color: var(--muted); font-size: 12px; }
+.post-links-more:hover { color: var(--accent-text); background: var(--hover); }
+.reply-card .post-links { margin-top: 10px; padding-top: 8px; }
+
+/* Read-write controls: reaction toggle/picker, boost composer and boost delete.
+   Writes stay behind explicit clicks and reuse the original site's endpoints. */
+.reaction-action { display: inline-flex; align-items: center; justify-content: center; gap: 4px; min-width: 40px; height: 40px; padding: 8px 10px; border-radius: 4px; color: var(--muted); font-size: 12px; border: 1px solid transparent; transition: color 100ms ease, background-color 100ms ease, transform 80ms ease; }
+.reaction-action:hover:not(:disabled) { background: var(--hover); color: var(--accent-text); }
+.reaction-action:active:not(:disabled) { transform: scale(.9); }
+.reaction-action.active { color: var(--danger); }
+.reaction-action.busy { opacity: .72; cursor: progress; pointer-events: none; }
+.reaction-action .ic { --icon-size: 16px; }
+.reaction-action .reaction-emoji { display: block; width: 18px; height: 18px; }
+.reaction-picker-open { padding: 8px 10px; }
+.reaction-picker { display: grid; grid-template-columns: repeat(6, 1fr); gap: 2px; padding: 2px 0 4px; }
+.reaction-choice { display: grid; place-items: center; width: 38px; height: 38px; border-radius: 7px; }
+.reaction-choice:hover:not(:disabled) { background: var(--hover); }
+.reaction-choice.checked { background: var(--accent-soft); box-shadow: inset 0 0 0 1px var(--accent-line); }
+.reaction-choice .reaction-emoji { display: block; width: 22px; height: 22px; }
+.post-boost-actions { display: flex; align-items: center; gap: 8px; margin-top: 10px; }
+.boost-action { display: inline-flex; align-items: center; gap: 5px; padding: 3px 9px; border-radius: 999px; border: 1px solid var(--border); background: var(--paper); color: var(--muted); font-size: 12px; }
+.boost-action:hover:not(:disabled) { color: var(--accent-text); background: var(--accent-soft); border-color: var(--accent-line); }
+.boost-action .ic { --icon-size: 14px; }
+.boost-delete { display: grid; place-items: center; width: 18px; height: 18px; margin-left: 1px; border-radius: 50%; color: var(--muted); background: var(--paper); }
+.boost-delete:hover:not(:disabled) { color: var(--danger); background: var(--accent-soft); }
+.boost-delete .ic { --icon-size: 11px; }
+.boost-composer { display: grid; gap: 7px; }
+.boost-editor { min-height: 38px; max-height: 92px; overflow: auto; padding: 6px 8px; border: 1px solid var(--border); border-radius: 7px; font-size: 14px; line-height: 1.7; overflow-wrap: anywhere; background: var(--paper); }
+.boost-editor:focus { outline: 2px solid var(--accent-line); outline-offset: 1px; }
+.boost-editor[data-empty="true"]::before { content: attr(data-placeholder); color: var(--muted); pointer-events: none; }
+.boost-editor img.emoji { width: 20px; height: 20px; vertical-align: -0.25em; }
+.boost-palette { max-height: 188px; overflow: auto; overscroll-behavior: contain; scrollbar-width: thin; border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); padding: 2px 0; }
+.boost-emoji-group { margin: 5px 0 3px; padding: 0 2px; color: var(--dim); font-size: 11px; font-weight: 650; }
+.boost-emoji-grid { display: grid; grid-template-columns: repeat(8, 1fr); gap: 1px; }
+.boost-emoji { display: grid; place-items: center; height: 30px; border-radius: 5px; }
+.boost-emoji:hover:not(:disabled) { background: var(--accent-soft); }
+.boost-emoji img { width: 24px; height: 24px; object-fit: contain; }
+.boost-footer { display: flex; align-items: center; gap: 6px; }
+.boost-counter { margin-right: auto; color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+.boost-counter.over { color: var(--danger); }
+.boost-submit { padding: 5px 12px; border-radius: 6px; border: 1px solid var(--border-strong); background: var(--accent-soft); color: var(--accent-text); font-weight: 680; }
+.boost-submit:hover:not(:disabled) { border-color: var(--accent-line); }
 
 .replies { margin-top: 30px; }
 .replies-heading { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px 16px; margin-bottom: 6px; padding: 15px 0 0; border-top: 1px solid var(--border); }

@@ -37,7 +37,7 @@ class Node {
   getAttribute(name) { if (name === "id") return this.id ?? null; if (name === "class") return this.className; if (name.startsWith("data-")) return this.dataset[dataKey(name.slice(5))] ?? null; return this.attributes.get(name) ?? null; }
   removeAttribute(name) { this.attributes.delete(name); }
   addEventListener() {}
-  focus() {}
+  focus() { if (this.disabled) return; let root = this; while (root.parentNode) root = root.parentNode; root.activeElement = this; }
   scrollIntoView() {}
   getBoundingClientRect() { return { top: 0, left: 0, bottom: this.id === "read-scroll" ? 600 : 40, right: 600, width: 600, height: this.id === "read-scroll" ? 600 : 40 }; }
   matches(selector) {
@@ -52,14 +52,19 @@ class Node {
   }
   closest(selector) { for (let node = this; node; node = node.parentNode) if (node.matches(selector)) return node; return null; }
   querySelectorAll(selector) {
-    const parts = selector.trim().split(/\s+/), matches = [], stack = [...this.children].reverse();
+    // A selector list is a union in DOM order. Treating a comma as another
+    // descendant used to hide production-wide disable/enable operations.
+    const alternatives = selector.split(",").map(part => part.trim().split(/\s+/));
+    const matches = [], stack = [...this.children].reverse();
     while (stack.length) {
       const node = stack.pop(); if (!(node instanceof Node)) continue;
       stack.push(...[...node.children].reverse());
-      if (!node.matches(parts.at(-1))) continue;
-      let ancestor = node.parentNode, index = parts.length - 2;
-      while (index >= 0 && ancestor) { if (ancestor.matches(parts[index])) index--; ancestor = ancestor.parentNode; }
-      if (index < 0) matches.push(node);
+      if (alternatives.some(parts => {
+        if (!node.matches(parts.at(-1))) return false;
+        let ancestor = node.parentNode, index = parts.length - 2;
+        while (index >= 0 && ancestor) { if (ancestor.matches(parts[index])) index--; ancestor = ancestor.parentNode; }
+        return index < 0;
+      })) matches.push(node);
     }
     return matches;
   }
@@ -69,7 +74,7 @@ class Node {
 const post = (floor, extra = {}) => ({ id: 100 + floor, topic_id: 123, post_number: floor, username: `user${floor}`,
   cooked: `<p>body${floor}</p>`, created_at: "2026-11-18T01:00:00Z", ...extra });
 function fixture({ posts = [post(1), post(2)], user = { id: 7 }, data: changes = {}, reply, nativeContext,
-  url = "https://linux.do/", livePending = new Set(), page, topicResponse, records = [] } = {}) {
+  url = "https://linux.do/", livePending = new Set(), page, topicResponse, records = [], preloaded, changeResponse } = {}) {
   const root = new Node("root"); root._connected = true;
   const shell = new Node("div", "shell"), toolbar = new Node(), actions = new Node(), reading = new Node(), status = new Node(), scroll = new Node();
   actions.id = "reading-actions"; reading.id = "reading"; status.id = "live-status"; status.hidden = true; scroll.id = "read-scroll";
@@ -79,7 +84,7 @@ function fixture({ posts = [post(1), post(2)], user = { id: 7 }, data: changes =
     draft_key: "topic_123", draft_sequence: 4, tags: [], details: { can_create_post: true, notification_level: 1 }, ...changes };
   const detail = { data, posts: new Map(posts.map(value => [value.id, value])), stream: posts.map(value => value.id),
     attempted: new Set(posts.map(value => value.id)), collapsed: new Set(), sort: "oldest", controller: new AbortController(), retryAt: 0 };
-  const calls = { reply: [], requests: [], pages: [], cooked: [], context: 0, notifications: [], sessions: [], stopped: 0, refreshed: 0, kicked: 0, paused: [], deferred: [], deferredInfo: [] };
+  const calls = { reply: [], requests: [], pages: [], cooked: [], context: 0, notifications: [], sessions: [], stopped: 0, refreshed: 0, kicked: 0, paused: [], deferred: [], deferredInfo: [], changes: [] };
   let cooling = 0;
   const bridge = {
     async reply(...args) { calls.reply.push(plain(args)); return reply ? reply(...args) : { opened: true }; },
@@ -103,15 +108,22 @@ function fixture({ posts = [post(1), post(2)], user = { id: 7 }, data: changes =
     cooked(value) { calls.cooked.push(value); const node = new Node("div", "cooked"); node.textContent = value; return node; },
     async request(path, options) { calls.requests.push({ path, options }); if (topicResponse) await topicResponse(path, options); return { ...data, post_stream: { stream: [...detail.stream], posts } }; },
     async postsPage(topicId, ids, signal, options) { calls.pages.push({ topicId, ids: [...ids], signal, options }); return page ? page(ids, signal) : ids.map(id => post(id - 100)); },
+    async change(path, method, body, options) {
+      calls.changes.push({ path, method, body: body === undefined ? null : plain(body), options });
+      if (typeof changeResponse === "function") return changeResponse(path, method, body);
+      return changeResponse || {};
+    },
     requestQueue: { cooldown: () => cooling, busyError: () => Object.assign(new Error("原站限流"), { status: 429, retryAt: Date.now() + cooling, retryAfter: cooling }),
       diagnostics: () => records,
       defer: (delay, options = {}) => { cooling = Math.max(cooling, delay); calls.deferred.push(delay); calls.deferredInfo.push(plain(options)); } }
   };
   const location = new URL(url);
-  const document = { readyState: "loading", hidden: false, activeElement: null, createElement: tag => new Node(tag), addEventListener() {}, getElementById: () => null };
+  const preloadedNode = preloaded ? Object.assign(new Node("script"), { textContent: JSON.stringify(preloaded) }) : null;
+  const document = { readyState: "loading", hidden: false, activeElement: null, createElement: tag => new Node(tag), addEventListener() {},
+    getElementById: id => id === "data-preloaded" ? preloadedNode : null };
   const window = { location, addEventListener() {}, removeEventListener() {} };
   const context = vm.createContext({ URL, URLSearchParams, Intl, AbortController, DOMException, setTimeout, clearTimeout, Node, Element: Node,
-    document, window, location, performance: { now: () => 0 }, LDForum: forum, LDLive: { TopicSession: LiveSession },
+    document, window, location, innerWidth: 1440, innerHeight: 900, performance: { now: () => 0 }, LDForum: forum, LDLive: { TopicSession: LiveSession },
     __root: root, __detail: detail, __bridge: bridge, __calls: calls, __user: user });
   vm.runInContext(source("navigation.js"), context);
   vm.runInContext(source("discussions.js"), context);
@@ -123,7 +135,8 @@ function fixture({ posts = [post(1), post(2)], user = { id: 7 }, data: changes =
     updateSteps = renderList = renderFilters = closeMenu = closeSidebar = sizeReader = resetReplyPager = scheduleRecovery = () => {};
     notify = message => __calls.notifications.push(message);
     globalThis.readerTest = { state, renderReading, renderReplies, replyTo, clicked, startTopicLive,
-      pendingPostIds, loadReplies, loadContext, clearTopic, selectTopic, canReply, populateMenu };
+      pendingPostIds, loadReplies, loadContext, clearTopic, selectTopic, canReply, populateMenu,
+      openMenu, toggleReaction, submitBoost, deleteBoost, postByFloor, boostStats };
     const requestedAtStart = false;
   `);
   vm.runInContext(script, context);
@@ -135,8 +148,8 @@ function fixture({ posts = [post(1), post(2)], user = { id: 7 }, data: changes =
 
 test("actual reader render wires topic and available floor replies without leaking cooked data into the bridge", async () => {
   const f = fixture({ posts: [post(1), post(2, { user_id: 8, post_type: 1 })] }); f.render();
-  assert.deepEqual(f.controls().map(control => control.dataset.value), ["0", "2"]);
-  assert.equal(f.root.querySelectorAll(".post-actions").length, 1);
+  assert.deepEqual(f.controls().map(control => control.dataset.value), ["0", "1", "2"]);
+  assert.equal(f.root.querySelectorAll(".post-actions").length, 2);
   await f.api.replyTo(2); await f.api.replyTo(0);
   assert.equal(f.calls.reply.length, 2);
   const [topic, target] = f.calls.reply[0];
@@ -152,7 +165,7 @@ test("deleted/hidden/unavailable/missing floors have no reply action while avail
   const f = fixture({ posts: [post(1), post(2, { deleted: true, cooked: "OLD SECRET", username: "OLD AUTHOR" }),
     post(3, { reply_to_post_number: 2 }), post(4, { hidden: true }), post(5, { unavailable: true }), post(7, { reply_to_post_number: 6 })] });
   f.render();
-  assert.deepEqual(f.controls().map(control => control.dataset.value), ["0", "3", "7"]);
+  assert.deepEqual(f.controls().map(control => control.dataset.value), ["0", "1", "3", "7"]);
   assert.doesNotMatch(f.root.textContent, /OLD SECRET|OLD AUTHOR/);
   for (const floor of [2, 4, 5, 6, 99]) await f.api.replyTo(floor);
   assert.equal(f.calls.reply.length, 0);
@@ -417,4 +430,421 @@ test("reading pane CSS reserves separate toolbar/status/content rows and preserv
   assert.match(css, /\.reading-pane\s*\{\s*grid-template-rows:\s*auto auto minmax\(0, 1fr\)/);
   assert.match(css, /\.read-scroll\s*\{\s*grid-row:\s*3/);
   assert.match(css, /\[hidden\][\s\S]*display:\s*none\s*!important/);
+});
+
+test("original-site extras render under the first post and available replies without extra requests", () => {
+  const links = Array.from({ length: 7 }, (_, index) => ({
+    url: `https://linux.do/t/topic/${100 + index}/${index + 2}`, internal: true, reflection: true,
+    clicks: 90 - index * 10, title: `相关话题 ${index}`
+  }));
+  const f = fixture({ posts: [
+    post(1, {
+      reactions: [{ id: "heart", count: 59 }, { id: "+1", count: 2 }, { id: "clap", count: 1 }],
+      reaction_users_count: 62,
+      boosts: [
+        { id: 1, cooked: "<p>前排</p>", user: { username: "neo", name: "Neo", avatar_template: "/u/{size}.png" } },
+        { id: 2, cooked: "<p>支持</p>", user: { username: "ada", avatar_template: "/a/{size}.png" } }
+      ],
+      link_counts: [{ url: "https://github.com/x", internal: false, reflection: false, clicks: 900, title: "outbound" }, ...links]
+    }),
+    post(2, { reactions: [{ id: "heart", count: 3 }], reaction_users_count: 3, boosts: [], link_counts: [] })
+  ] });
+  f.render();
+  assert.equal(f.root.querySelectorAll(".post-reactions").length, 2);
+  const op = f.root.querySelector('.op-content[data-post-number="1"]');
+  assert.equal(op.querySelectorAll(".reaction").length, 3);
+  assert.equal(op.querySelector(".reaction-total").textContent, "62");
+  assert.equal(op.querySelectorAll(".reaction-emoji")[0].src, "/images/emoji/twemoji/heart.png");
+  assert.match(op.querySelector(".post-reactions").getAttribute("aria-label"), /:heart: 59.*共 62 个表情回应/);
+  assert.equal(op.querySelectorAll(".boost").length, 2);
+  assert.match(op.querySelector(".post-boosts").textContent, /前排/);
+  assert.match(op.querySelector(".boost").getAttribute("title"), /@neo/);
+  assert.equal(op.querySelectorAll(".post-link").length, 5);
+  assert.equal(op.querySelectorAll(".post-link-count")[0].textContent, "90");
+  assert.match(op.querySelector(".post-links-more").textContent, /其他 2 个/);
+  // The reply keeps its floor/date meta but the duplicated like stat is gone.
+  const reply = f.root.querySelector(".reply-card");
+  assert.equal(reply.querySelectorAll(".post-reactions").length, 1);
+  assert.equal(reply.querySelectorAll(".reply-meta .ic-heart").length, 0);
+  assert.equal(f.calls.requests.length, 0);
+});
+
+test("related links expand and collapse in place without another request", () => {
+  const links = Array.from({ length: 7 }, (_, index) => ({
+    url: `https://linux.do/t/topic/${100 + index}`, internal: true, reflection: true,
+    clicks: 90 - index, title: `相关话题 ${index}`
+  }));
+  const f = fixture({ posts: [post(1, { link_counts: links })] });
+  f.render();
+  const op = () => f.root.querySelector('.op-content[data-post-number="1"]');
+  assert.equal(op().querySelectorAll(".post-link").length, 5);
+  assert.equal(f.detail.expandedLinks, undefined);
+  f.api.clicked({ target: op().querySelector('[data-action="post-links"]') });
+  assert.equal(op().querySelectorAll(".post-link").length, 7);
+  assert.match(op().querySelector(".post-links-more").textContent, /收起相关链接/);
+  assert.deepEqual(plain([...f.detail.expandedLinks]), [1]);
+  f.api.clicked({ target: op().querySelector('[data-action="post-links"]') });
+  assert.equal(op().querySelectorAll(".post-link").length, 5);
+  assert.equal(f.detail.expandedLinks.size, 0);
+  assert.equal(f.calls.requests.length, 0);
+  assert.equal(f.calls.pages.length, 0);
+});
+
+test("reaction emoji reuse the preloaded emoji set and custom emoji upload urls", () => {
+  const f = fixture({ posts: [post(1, {
+    reactions: [{ id: "heart", count: 2 }, { id: "bili_057", count: 1 }, { id: "odd name!", count: 1 }],
+    reaction_users_count: 4
+  })], preloaded: {
+    siteSettings: JSON.stringify({ emoji_set: "noto" }),
+    customEmoji: JSON.stringify([{ name: "bili_057", url: "https://cdn3.ldstatic.com/bili.png" }])
+  } });
+  f.render();
+  const sources = f.root.querySelectorAll(".reaction-emoji").map(image => image.src);
+  assert.deepEqual(sources, ["/images/emoji/noto/heart.png", "https://cdn3.ldstatic.com/bili.png"]);
+  assert.match(f.root.querySelector(".reaction-name").textContent, /:odd name!:/);
+  assert.equal(f.root.querySelector(".reaction-total").textContent, "4");
+  assert.equal(f.calls.requests.length, 0);
+});
+
+test("reaction controls render for available posts and stay hidden on own posts", () => {
+  const f = fixture({ posts: [post(1), post(2, { yours: true })] });
+  f.render();
+  const op = f.root.querySelector('.op-content[data-post-number="1"]');
+  assert.ok(op.querySelector('[data-action="react"]'));
+  assert.ok(op.querySelector('[data-action="react-picker"]'));
+  assert.equal(op.querySelector(".post-reactions"), null, "zero responses have no read-only summary");
+  assert.ok(op.querySelector(".post-controls .post-actions"));
+  assert.equal(op.querySelector(".reaction-total"), null);
+  const own = f.root.querySelector('.reply-card[data-post-number="2"]');
+  assert.equal(own.querySelector('[data-action="react"]'), null);
+  assert.equal(own.querySelector('[data-action="react-picker"]'), null);
+  assert.equal(f.calls.requests.length, 0);
+});
+
+test("reaction toggle uses the original toggle endpoint and merges the serialized post", async () => {
+  const f = fixture({ posts: [post(1)], changeResponse: () => ({
+    reactions: [{ id: "heart", type: "emoji", count: 1 }], reaction_users_count: 1,
+    current_user_reaction: { id: "heart", type: "emoji", can_undo: true }, current_user_used_main_reaction: true,
+    actions_summary: [{ id: 2, count: 1, can_act: true }], like_count: 1
+  }) });
+  f.render();
+  await f.api.toggleReaction(1, "heart");
+  assert.deepEqual(plain(f.calls.changes), [{ path: "/discourse-reactions/posts/101/custom-reactions/heart/toggle.json", method: "PUT", body: null }]);
+  const updated = f.detail.posts.get(101);
+  assert.equal(updated.reaction_users_count, 1);
+  assert.deepEqual(plain(updated.current_user_reaction), { id: "heart", type: "emoji", can_undo: true });
+  const toggle = f.root.querySelector('.op-content [data-action="react"]');
+  assert.match(toggle.className, /active/);
+  assert.equal(toggle.getAttribute("aria-pressed"), "true");
+  assert.equal(f.root.querySelector('.op-content .reaction-total').textContent, "1");
+  assert.equal(f.calls.requests.length, 0, "a write must not read the topic again");
+});
+
+test("fixture selector lists preserve DOM order and deduplicate controls", () => {
+  const root = new Node("root"), first = new Node("button"), second = new Node("button");
+  first.dataset.action = "react"; second.dataset.action = "react-picker";
+  root.append(first, second);
+  assert.deepEqual(root.querySelectorAll('[data-action="react-picker"], [data-action="react"], button'), [first, second]);
+});
+
+const reactionResponse = (count = 1) => ({
+  reactions: [{ id: "heart", type: "emoji", count }], reaction_users_count: count,
+  current_user_reaction: { id: "heart", type: "emoji", can_undo: true },
+  current_user_used_main_reaction: true, actions_summary: [{ id: 2, count, can_act: true }], like_count: count
+});
+const floorCard = (f, floor) => f.root.querySelector(`[data-post-number="${floor}"]`);
+const reactionControls = card => card.querySelectorAll('[data-action="react"], [data-action="react-picker"]');
+const actionUnavailable = control => !!control.disabled || control.getAttribute("aria-disabled") === "true";
+
+test("pending reactions disable only their own floor and allow another floor's explicit action", async () => {
+  const finish = new Map();
+  const f = fixture({ posts: [post(1), post(2), post(3)], changeResponse: path => new Promise(resolve => finish.set(path, resolve)) });
+  f.render();
+  const second = f.api.toggleReaction(2, "heart");
+  let third;
+  try {
+    assert.ok(reactionControls(floorCard(f, 2)).every(actionUnavailable));
+    assert.ok(reactionControls(floorCard(f, 1)).every(control => !actionUnavailable(control)), "the OP must stay usable while a reply writes");
+    assert.ok(reactionControls(floorCard(f, 3)).every(control => !actionUnavailable(control)));
+    await f.api.toggleReaction(2, "heart");
+    assert.equal(f.calls.changes.length, 1, "a duplicate activation on the same pending floor must not toggle twice");
+    third = f.api.toggleReaction(3, "heart");
+    assert.equal(f.calls.changes.length, 2, "another floor's explicit action is not silently discarded");
+    assert.ok(reactionControls(floorCard(f, 3)).every(actionUnavailable));
+    assert.ok(reactionControls(floorCard(f, 1)).every(control => !actionUnavailable(control)));
+  } finally {
+    for (const resolve of finish.values()) resolve(reactionResponse());
+    await Promise.all([second, third]);
+  }
+  for (const floor of [1, 2, 3]) assert.ok(reactionControls(floorCard(f, floor)).every(control => !actionUnavailable(control)));
+});
+
+test("reply reaction completion and failure never leave the OP controls disabled", async () => {
+  for (const fails of [false, true]) {
+    const f = fixture({ changeResponse: () => {
+      if (fails) throw new Error("reaction failed");
+      return reactionResponse();
+    } });
+    f.render();
+    await f.api.toggleReaction(2, "heart");
+    for (const floor of [1, 2]) {
+      const controls = reactionControls(floorCard(f, floor));
+      assert.equal(controls.length, 2);
+      assert.ok(controls.every(control => !actionUnavailable(control)), `floor ${floor} must recover after ${fails ? "failure" : "success"}`);
+    }
+    if (fails) assert.match(f.calls.notifications.at(-1), /reaction failed/);
+  }
+});
+
+test("reaction updates preserve the OP, reply cards, cooked bodies, sort control and active-floor focus", async () => {
+  for (const floor of [1, 2]) {
+    const f = fixture({ posts: [post(1), post(2), post(3)], changeResponse: () => reactionResponse(8) });
+    f.render();
+    const cards = [1, 2, 3].map(value => floorCard(f, value));
+    const bodies = cards.map(card => card.querySelector(".post-content"));
+    assert.ok(bodies.every(Boolean), "the preservation check must observe real cooked body nodes");
+    const otherFloor = floor === 1 ? 2 : 1;
+    const otherControls = floorCard(f, otherFloor).querySelector(".post-controls");
+    const sort = f.root.querySelector("#reply-sort");
+    floorCard(f, floor).querySelector('[data-action="react"]').focus();
+    await f.api.toggleReaction(floor, "heart");
+    for (let index = 0; index < cards.length; index++) {
+      assert.equal(floorCard(f, index + 1), cards[index], "a reaction must not recreate a post card");
+      assert.equal(cards[index].querySelector(".post-content"), bodies[index], "cooked bodies must not be rerendered");
+    }
+    assert.equal(floorCard(f, otherFloor).querySelector(".post-controls"), otherControls);
+    assert.equal(f.root.querySelector("#reply-sort"), sort, "the whole reply tree must not be rebuilt");
+    const toggle = floorCard(f, floor).querySelector('[data-action="react"]');
+    assert.equal(f.root.activeElement, toggle, "focus must return to the replacement action on the same post");
+    assert.ok(toggle.isConnected);
+    assert.equal(toggle.getAttribute("aria-pressed"), "true");
+    assert.equal(floorCard(f, floor).querySelector(".reaction-total").textContent, "8", "the server response supersedes the optimistic count");
+    assert.equal(f.calls.requests.length, 0);
+    assert.equal(f.calls.pages.length, 0);
+  }
+});
+
+test("a reaction gives immediate optimistic feedback and rolls back a failed write without retry", async () => {
+  let fail;
+  const f = fixture({ posts: [post(1), post(2, {
+    reactions: [{ id: "heart", type: "emoji", count: 4 }], reaction_users_count: 4,
+    current_user_reaction: null, current_user_used_main_reaction: false,
+    actions_summary: [{ id: 2, count: 4, can_act: true }], like_count: 4
+  })], changeResponse: () => new Promise((resolve, reject) => { fail = reject; }) });
+  f.render();
+  const before = plain(f.detail.posts.get(102));
+  const writing = f.api.toggleReaction(2, "heart");
+  try {
+    const card = floorCard(f, 2);
+    assert.equal(card.querySelector('[data-action="react"]').getAttribute("aria-pressed"), "true", "the click is visible before the response");
+    assert.equal(card.querySelector(".reaction-total").textContent, "5");
+    assert.equal(f.detail.posts.get(102).current_user_reaction.id, "heart");
+  } finally {
+    fail(new Error("offline reaction"));
+    await writing;
+  }
+  const card = floorCard(f, 2);
+  assert.equal(card.querySelector('[data-action="react"]').getAttribute("aria-pressed"), "false");
+  assert.equal(card.querySelector(".reaction-total").textContent, "4");
+  assert.deepEqual(plain(f.detail.posts.get(102)), before);
+  assert.equal(f.calls.changes.length, 1, "toggle writes must never be automatically replayed");
+  assert.match(f.calls.notifications.at(-1), /offline reaction/);
+  assert.ok(reactionControls(card).every(control => !actionUnavailable(control)));
+});
+
+test("like-only posts preserve their existing count during the optimistic update", async () => {
+  let finish;
+  const f = fixture({ posts: [post(1), post(2, { like_count: 4 })], changeResponse: () => new Promise(resolve => { finish = resolve; }) });
+  f.render();
+  assert.equal(floorCard(f, 2).querySelector(".reaction-total").textContent, "4");
+  const writing = f.api.toggleReaction(2, "heart");
+  try {
+    assert.equal(floorCard(f, 2).querySelector(".reaction-total").textContent, "5", "a missing reactions array must not reset four existing likes to one");
+    assert.equal(floorCard(f, 2).querySelector('[data-action="react"]').getAttribute("aria-pressed"), "true");
+  } finally {
+    finish(reactionResponse(5));
+    await writing;
+  }
+  assert.equal(floorCard(f, 2).querySelector(".reaction-total").textContent, "5");
+});
+
+test("an older floor's reaction response never steals focus from a newer floor's action", async () => {
+  const finish = new Map();
+  const f = fixture({ posts: [post(1), post(2), post(3)], changeResponse: path => new Promise(resolve => finish.set(path, resolve)) });
+  f.render();
+  floorCard(f, 2).querySelector('[data-action="react"]').focus();
+  const second = f.api.toggleReaction(2, "heart");
+  floorCard(f, 3).querySelector('[data-action="react"]').focus();
+  const third = f.api.toggleReaction(3, "heart");
+  const active = floorCard(f, 3).querySelector('[data-action="reply"]');
+  active.focus();
+  try {
+    finish.get("/discourse-reactions/posts/102/custom-reactions/heart/toggle.json")(reactionResponse());
+    await second;
+    assert.equal(f.root.activeElement, active, "the earlier response must leave the user's current enabled action alone");
+    assert.ok(active.isConnected);
+  } finally {
+    for (const resolve of finish.values()) resolve(reactionResponse());
+    await Promise.all([second, third]);
+  }
+});
+
+test("like, picker and reply share a bottom action row with a read-only summary and large hit targets", () => {
+  const f = fixture({ posts: [post(1, reactionResponse(3)), post(2, reactionResponse(2))] });
+  f.render();
+  for (const floor of [1, 2]) {
+    const card = floorCard(f, floor);
+    const row = card.querySelector(".post-controls"), actions = row?.querySelector(".post-actions");
+    assert.ok(row && actions, "each available post has one bottom controls row");
+    assert.equal(card.querySelectorAll(".post-controls").length, 1);
+    const summary = row.querySelector(".post-reactions");
+    assert.ok(summary);
+    assert.equal(summary.querySelectorAll("button").length, 0, "counts and sampled emoji are not ambiguous tiny buttons");
+    assert.deepEqual(actions.querySelectorAll("button").map(control => control.dataset.action), ["react", "react-picker", "reply"]);
+    assert.equal(actions.parentElement, row);
+    assert.ok(card.children.indexOf(row) > card.children.indexOf(card.querySelector(".post-content")));
+    const toggle = actions.querySelector('[data-action="react"]');
+    assert.equal(toggle.tagName, "BUTTON");
+    assert.ok(toggle.getAttribute("aria-label"));
+    assert.equal(toggle.getAttribute("aria-pressed"), "true");
+  }
+  const css = source("reader.css");
+  const actionRule = css.match(/\.reaction-action\s*\{([^}]+)\}/)?.[1];
+  assert.ok(actionRule);
+  assert.ok(Number(actionRule.match(/min-width:\s*(\d+)px/)?.[1]) >= 40, "the main and picker actions need at least 40px width");
+  assert.ok(Number(actionRule.match(/(?:min-)?height:\s*(\d+)px/)?.[1]) >= 40, "the action row needs at least 40px height");
+  const rowRule = css.match(/\.post-controls\s*\{([^}]+)\}/)?.[1];
+  assert.match(rowRule || "", /display:\s*flex/);
+});
+
+test("rendered reaction and boost controls are wired to their write endpoints", async () => {
+  const f = fixture({ posts: [post(1, { can_boost: true, boosts: [] })] });
+  f.render();
+  f.api.clicked({ target: f.root.querySelector('.op-content [data-action="react"]') });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.deepEqual(plain(f.calls.changes.map(change => [change.path, change.method])),
+    [["/discourse-reactions/posts/101/custom-reactions/heart/toggle.json", "PUT"]]);
+  f.api.clicked({ target: f.root.querySelector('[data-action="boost-compose"]') });
+  assert.ok(f.root.querySelector("#boost-editor"), "the boost composer opens from its trigger");
+  assert.equal(f.calls.changes.length, 1, "opening the composer must not write anything");
+});
+
+test("reaction writes are gated by login, ownership and undo permission", async () => {
+  const guest = fixture({ posts: [post(1)], user: null });
+  guest.render();
+  await guest.api.toggleReaction(1, "heart");
+  assert.equal(guest.calls.changes.length, 0);
+  assert.match(guest.calls.notifications.at(-1), /登录/);
+
+  const own = fixture({ posts: [post(1, { yours: true })] });
+  own.render();
+  await own.api.toggleReaction(1, "heart");
+  assert.equal(own.calls.changes.length, 0);
+
+  const locked = fixture({ posts: [post(1, {
+    reactions: [{ id: "heart", count: 3 }], reaction_users_count: 3,
+    current_user_reaction: { id: "heart", can_undo: false }
+  })] });
+  locked.render();
+  assert.equal(locked.root.querySelector('.op-content [data-action="react"]').disabled, true);
+  await locked.api.toggleReaction(1, "heart");
+  assert.equal(locked.calls.changes.length, 0);
+  assert.match(locked.calls.notifications.at(-1), /不能取消/);
+});
+
+test("the reaction picker lists valid reactions and marks the current one", async () => {
+  const f = fixture({
+    posts: [post(1, {
+      reactions: [{ id: "+1", count: 4 }], reaction_users_count: 4,
+      current_user_reaction: { id: "+1", can_undo: true }
+    })],
+    data: { valid_reactions: ["heart", "+1", "bili_057"] },
+    preloaded: {
+      siteSettings: JSON.stringify({ emoji_set: "twemoji", discourse_reactions_reaction_for_like: "heart" }),
+      customEmoji: JSON.stringify([{ name: "bili_057", url: "https://cdn3.ldstatic.com/b.png", group: "b站" }])
+    }
+  });
+  f.render();
+  const trigger = f.root.querySelector('[data-action="react-picker"]');
+  f.api.openMenu("reactions", trigger, { post: f.detail.posts.get(101), width: 276 });
+  const choices = f.root.querySelectorAll(".reaction-choice");
+  assert.equal(choices.length, 3);
+  assert.equal(f.root.querySelector(".reaction-choice.checked").dataset.value, "+1");
+  assert.equal(choices[2].querySelector("img").src, "https://cdn3.ldstatic.com/b.png");
+  f.api.clicked({ target: choices[0] });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(f.calls.changes[0].path, "/discourse-reactions/posts/101/custom-reactions/heart/toggle.json");
+});
+
+test("boost composer posts the original endpoint contract and adds the boost locally", async () => {
+  const f = fixture({
+    posts: [
+      post(1, { can_boost: true, boosts: [], username: "neo" }),
+      post(2, { can_boost: true, boosts: [{ id: 9, cooked: "<p>沙发</p>", can_delete: false, user: { id: 3, username: "x", avatar_template: "/a.png" } }] })
+    ],
+    changeResponse: () => ({ id: 77, cooked: "<p>前排</p>", can_delete: true, user: { id: 7, username: "me", avatar_template: "/m.png" } })
+  });
+  f.render();
+  const op = f.root.querySelector('.op-content[data-post-number="1"]');
+  assert.ok(op.querySelector('[data-action="boost-compose"]'));
+  assert.equal(f.root.querySelector('.reply-card[data-post-number="2"] [data-action="boost-compose"]'), null);
+  f.api.openMenu("boost", op.querySelector('[data-action="boost-compose"]'), { post: f.detail.posts.get(101), width: 332 });
+  const editor = f.root.querySelector("#boost-editor");
+  assert.ok(editor);
+  editor.append("前排");
+  await f.api.submitBoost(1);
+  assert.deepEqual(plain(f.calls.changes), [{ path: "/discourse-boosts/posts/101/boosts.json", method: "POST", body: { raw: "前排" } }]);
+  const updated = f.detail.posts.get(101);
+  assert.equal(updated.can_boost, false);
+  assert.equal(updated.boosts[0].id, 77);
+  assert.ok(f.calls.notifications.some(message => message.includes("已发布")));
+  assert.ok(f.root.querySelector(".post-boosts .boost"));
+  assert.ok(f.root.querySelector(".boost-delete"));
+  assert.equal(f.calls.requests.length, 0);
+});
+
+test("boost submit rejects oversized drafts and surfaces rate limits without retries", async () => {
+  const f = fixture({
+    posts: [post(1, { can_boost: true, boosts: [] })],
+    changeResponse: () => { throw Object.assign(new Error("原站限流（表情评论）"), { status: 429, retryAfter: 5000, retryAt: Date.now() + 5000 }); }
+  });
+  f.render(); f.live();
+  f.api.openMenu("boost", f.root.querySelector('[data-action="boost-compose"]'), { post: f.detail.posts.get(101), width: 332 });
+  const editor = f.root.querySelector("#boost-editor");
+  editor.append("一二三四五六七八九十一二三四五六七");
+  await f.api.submitBoost(1);
+  assert.equal(f.calls.changes.length, 0);
+  assert.match(f.calls.notifications.at(-1), /最多 16 个字/);
+  editor.textContent = "";
+  editor.append("沙发");
+  await f.api.submitBoost(1);
+  assert.equal(f.calls.changes.length, 1);
+  assert.match(f.calls.notifications.at(-1), /限流/);
+  assert.equal(f.calls.paused.length, 1);
+  assert.equal(f.detail.posts.get(101).boosts.length, 0, "a failed boost must not be added locally");
+});
+
+test("deleting an own boost uses the delete endpoint and restores the composer", async () => {
+  const f = fixture({ posts: [post(1, {
+    can_boost: false,
+    boosts: [{ id: 55, cooked: "<p>沙发</p>", can_delete: true, user: { id: 7, username: "me", avatar_template: "/m.png" } }]
+  })] });
+  f.render();
+  const remove = f.root.querySelector('[data-action="delete-boost"]');
+  assert.ok(remove);
+  f.api.clicked({ target: remove });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.deepEqual(plain(f.calls.changes), [{ path: "/discourse-boosts/boosts/55.json", method: "DELETE", body: null }]);
+  assert.equal(f.detail.posts.get(101).boosts.length, 0);
+  assert.equal(f.detail.posts.get(101).can_boost, true);
+  assert.ok(f.root.querySelector('[data-action="boost-compose"]'));
+  assert.equal(f.calls.requests.length, 0);
+});
+
+test("boost draft stats count shortcodes and emoji as single characters", () => {
+  const f = fixture();
+  assert.deepEqual(plain(f.api.boostStats("前排")), { visible: 2, emoji: 0 });
+  assert.deepEqual(plain(f.api.boostStats(":bili_057:")), { visible: 1, emoji: 1 });
+  assert.deepEqual(plain(f.api.boostStats("😆😆")), { visible: 2, emoji: 2 });
+  assert.equal(f.api.boostStats("一二三四五六七八九十一二三四五六七八").visible, 18);
 });

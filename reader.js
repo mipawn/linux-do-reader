@@ -127,6 +127,564 @@
     return node;
   }
 
+  function parsePayload(value) {
+    if (value == null || typeof value !== "string") return value ?? null;
+    try { return JSON.parse(value); } catch { return null; }
+  }
+
+  // The original page embeds its site settings and emoji catalogue in one
+  // preloaded JSON script. Reading it keeps reactions and boosts offline: no
+  // extra request, and custom emoji keep their real upload urls.
+  let preloadedOnce;
+  function preloaded() {
+    if (preloadedOnce !== undefined) return preloadedOnce;
+    preloadedOnce = null;
+    try { preloadedOnce = parsePayload(document.getElementById?.("data-preloaded")?.textContent) || null; } catch {}
+    return preloadedOnce;
+  }
+
+  let settingsOnce;
+  function readerSettings() {
+    if (!settingsOnce) settingsOnce = parsePayload(preloaded()?.siteSettings) || {};
+    return settingsOnce;
+  }
+
+  function mainReactionId() {
+    const value = readerSettings().discourse_reactions_reaction_for_like;
+    return typeof value === "string" && value ? value : "heart";
+  }
+
+  let emojiCatalog;
+  function emojiSources() {
+    if (emojiCatalog) return emojiCatalog;
+    const catalog = { set: "twemoji", custom: new Map(), list: [] };
+    const settings = readerSettings();
+    if (typeof settings.emoji_set === "string" && /^[a-z0-9_-]+$/i.test(settings.emoji_set)) catalog.set = settings.emoji_set;
+    const custom = parsePayload(preloaded()?.customEmoji);
+    for (const emoji of Array.isArray(custom) ? custom : []) {
+      if (typeof emoji?.name === "string" && emoji.name && typeof emoji?.url === "string" && emoji.url) {
+        catalog.custom.set(emoji.name.toLowerCase(), emoji.url);
+        catalog.list.push({ name: emoji.name, group: typeof emoji.group === "string" && emoji.group ? emoji.group : "表情", url: emoji.url });
+      }
+    }
+    emojiCatalog = catalog;
+    return catalog;
+  }
+
+  function emojiSource(id) {
+    const name = String(id || "").toLowerCase();
+    if (!name) return null;
+    const catalog = emojiSources();
+    const custom = catalog.custom.get(name);
+    if (custom) {
+      const url = forum.safeURL(custom);
+      return url?.protocol === "https:" ? url.href : null;
+    }
+    if (!/^[a-z0-9_+-]+$/.test(name)) return null;
+    return `/images/emoji/${encodeURIComponent(catalog.set)}/${encodeURIComponent(name)}.png`;
+  }
+
+  function emojiImage(id, size = 16, className = "reaction-emoji") {
+    const source = emojiSource(id);
+    if (!source) return element("span", "reaction-name", `:${id}:`);
+    const image = element("img", className);
+    image.alt = "";
+    image.width = size;
+    image.height = size;
+    image.loading = "lazy";
+    image.referrerPolicy = "no-referrer";
+    image.src = source;
+    image.addEventListener("error", () => {
+      image.replaceWith(element("span", "reaction-name", `:${id}:`));
+    }, { once: true });
+    return image;
+  }
+
+  function postByFloor(floor) {
+    const detail = state.detail;
+    if (!detail || !Number.isSafeInteger(floor)) return null;
+    for (const post of detail.posts.values()) if (post.post_number === floor) return post;
+    return null;
+  }
+
+  function reactionIds(post) {
+    const ids = [];
+    const seen = new Set();
+    const push = id => { if (typeof id === "string" && id && !seen.has(id)) { seen.add(id); ids.push(id); } };
+    const valid = state.detail?.data?.valid_reactions;
+    for (const id of Array.isArray(valid) ? valid : []) push(id);
+    for (const reaction of globalThis.LDDiscussion.reactionSummary(post).reactions) push(reaction.id);
+    push(mainReactionId());
+    return ids;
+  }
+
+  function reactionInteractive(post) {
+    return !!post && !post.yours && globalThis.LDDiscussion.postState(post) === "available";
+  }
+
+  function reactionSummary(post) {
+    const { reactions, total } = globalThis.LDDiscussion.reactionSummary(post);
+    if (!total) return null;
+    const bar = element("div", "post-reactions");
+    bar.setAttribute("role", "group");
+    const labels = [];
+    const shown = reactions.slice(0, 3);
+    const mine = post.current_user_reaction && typeof post.current_user_reaction === "object" ? post.current_user_reaction : null;
+    if (mine?.id && !shown.some(reaction => reaction.id === mine.id)) {
+      const own = reactions.find(reaction => reaction.id === mine.id);
+      if (own) shown.push(own);
+    }
+    for (const reaction of shown) {
+      const item = add(element("span", "reaction"), emojiImage(reaction.id));
+      item.setAttribute("title", `:${reaction.id}: ${reaction.count}`);
+      labels.push(`:${reaction.id}: ${reaction.count}`);
+      bar.append(item);
+    }
+    bar.append(element("span", "reaction-total", number.format(total)));
+    const label = (labels.length ? labels.join("、") + "，" : "") + `共 ${total} 个表情回应`;
+    bar.setAttribute("aria-label", label);
+    if (labels.length) bar.setAttribute("title", label);
+    return bar;
+  }
+
+  function reactionActions(detail, post) {
+    if (!reactionInteractive(post)) return [];
+    const floor = Number.isSafeInteger(post.post_number) ? post.post_number : 0;
+    const mine = post.current_user_reaction && typeof post.current_user_reaction === "object" ? post.current_user_reaction : null;
+    const undoable = !mine || mine.can_undo !== false;
+    const busy = detail?.reactionBusyFloors instanceof Set && detail.reactionBusyFloors.has(floor);
+    const main = mainReactionId();
+    const toggle = button("", "react", {
+      className: "reaction-action" + (mine ? " active" : "") + (busy ? " busy" : ""),
+      value: floor
+    });
+    toggle.dataset.post = String(floor);
+    toggle.dataset.reaction = mine?.id || main;
+    toggle.append(mine?.id && mine.id !== main ? emojiImage(mine.id, 18, "reaction-emoji") : icon("heart"));
+    toggle.setAttribute("aria-pressed", String(!!mine));
+    const title = mine ? (undoable ? "取消你的表情回应" : "现在不能取消这个表情回应") : "点赞此帖子";
+    toggle.setAttribute("title", title);
+    toggle.setAttribute("aria-label", title);
+    toggle.disabled = !undoable;
+    if (busy) {
+      toggle.setAttribute("aria-busy", "true");
+      toggle.setAttribute("aria-disabled", "true");
+    }
+
+    const picker = button("选择表情回应", "react-picker", {
+      className: "reaction-action reaction-picker-open" + (busy ? " busy" : ""),
+      iconOnly: true,
+      symbol: "plus",
+      value: floor
+    });
+    picker.disabled = busy;
+    picker.setAttribute("aria-expanded", "false");
+    return [toggle, picker];
+  }
+
+  function postControls(detail, post) {
+    const row = element("div", "post-controls");
+    const summary = reactionSummary(post);
+    if (summary) row.append(summary);
+    const actions = element("div", "post-actions");
+    actions.append(...reactionActions(detail, post), replyButton(detail, post));
+    row.append(actions);
+    return row;
+  }
+
+  const mergedPostFields = ["reactions", "reaction_users_count", "current_user_reaction", "current_user_used_main_reaction", "actions_summary", "like_count", "yours"];
+
+  function mergePostFields(post, response) {
+    if (!response || typeof response !== "object") return;
+    for (const key of mergedPostFields) if (Object.hasOwn(response, key)) post[key] = response[key];
+  }
+
+  function renderPostFloor(floor) {
+    if (floor === 1) refreshReadingView();
+    else renderReplies();
+  }
+
+  function pauseForWrite(error, detail) {
+    if (![429, 502, 503, 504].includes(error?.status)) return;
+    detail.live?.pause(forum.requestQueue.busyError());
+    scheduleRecovery();
+  }
+
+  function postFieldSnapshot(post) {
+    return mergedPostFields.map(key => [key, Object.hasOwn(post, key), post[key]]);
+  }
+
+  function restorePostFields(post, snapshot) {
+    for (const [key, present, value] of snapshot) {
+      if (present) post[key] = value;
+      else delete post[key];
+    }
+  }
+
+  function applyOptimisticReaction(post, reaction) {
+    const current = post.current_user_reaction && typeof post.current_user_reaction === "object" ? post.current_user_reaction : null;
+    const previousId = current?.id || null;
+    const nextId = previousId === reaction ? null : reaction;
+    const original = globalThis.LDDiscussion.reactionSummary(post);
+    const source = Array.isArray(post.reactions) && post.reactions.length ? post.reactions : original.reactions;
+    const reactions = source.map(item => ({ ...item }));
+    const previousTotal = original.total;
+    const change = (id, delta) => {
+      if (!id || !delta) return;
+      let item = reactions.find(value => value?.id === id);
+      if (!item && delta > 0) {
+        item = { id, type: "emoji", count: 0 };
+        reactions.push(item);
+      }
+      if (item) item.count = Math.max(0, (Number(item.count) || 0) + delta);
+    };
+    change(previousId, -1);
+    change(nextId, 1);
+    post.reactions = reactions.filter(item => (Number(item?.count) || 0) > 0);
+    const total = Number(post.reaction_users_count);
+    const totalDelta = (nextId ? 1 : 0) - (previousId ? 1 : 0);
+    post.reaction_users_count = Math.max(0, (Number.isFinite(total) ? total : previousTotal) + totalDelta);
+    post.current_user_reaction = nextId ? { ...(current || {}), id: nextId, type: current?.type || "emoji", can_undo: true } : null;
+    const main = mainReactionId();
+    post.current_user_used_main_reaction = nextId === main;
+    if (Number.isFinite(Number(post.like_count))) {
+      const likeDelta = (nextId === main ? 1 : 0) - (previousId === main ? 1 : 0);
+      post.like_count = Math.max(0, Number(post.like_count) + likeDelta);
+    }
+  }
+
+  function refreshPostControls(floor, restoreAction = null) {
+    const detail = state.detail;
+    const post = postByFloor(floor);
+    const article = root.querySelector(`[data-post-number="${floor}"]`);
+    const current = article?.querySelector(".post-controls");
+    if (!detail || !post || !current) return;
+    const shouldRestoreFocus = !!restoreAction && current.contains(root.activeElement);
+    const replacement = postControls(detail, post);
+    current.replaceWith(replacement);
+    if (shouldRestoreFocus) replacement.querySelector(`[data-action="${restoreAction}"]`)?.focus({ preventScroll: true });
+    sizeReader();
+  }
+
+  // Match the original site's direct-like feel: update the clicked post at once,
+  // keep only that post busy, then reconcile with the authoritative response.
+  // A failed write restores the exact prior fields and never leaves a fake like.
+  async function toggleReaction(floor, reaction) {
+    const detail = state.detail;
+    const post = postByFloor(floor);
+    if (!detail || !post || !reaction || !reactionInteractive(post)) return;
+    if (!state.user) { notify("请先登录 Linux.do 后再表情回应。"); return; }
+    const busy = detail.reactionBusyFloors instanceof Set ? detail.reactionBusyFloors : (detail.reactionBusyFloors = new Set());
+    if (busy.has(floor)) return;
+    const mine = post.current_user_reaction;
+    if (mine?.can_undo === false) {
+      notify(mine.id === reaction ? "现在不能取消这个表情回应。" : "现在不能更换这个表情回应。");
+      return;
+    }
+    const snapshot = postFieldSnapshot(post);
+    busy.add(floor);
+    applyOptimisticReaction(post, reaction);
+    refreshPostControls(floor, "react");
+    try {
+      const response = await forum.change(
+        `/discourse-reactions/posts/${Number(post.id)}/custom-reactions/${encodeURIComponent(reaction)}/toggle.json`, "PUT");
+      if (state.detail !== detail) return;
+      mergePostFields(post, response);
+    } catch (error) {
+      restorePostFields(post, snapshot);
+      if (state.detail !== detail) return;
+      notify(error.message);
+      pauseForWrite(error, detail);
+    } finally {
+      busy.delete(floor);
+      if (state.detail === detail) refreshPostControls(floor, "react");
+    }
+  }
+
+  const boostMaxVisible = 16;
+  const boostMaxEmoji = 5;
+
+  function canBoost(post) {
+    return !!post && post.can_boost === true && !(Array.isArray(post.boosts) && post.boosts.length);
+  }
+
+  // Boost bubbles wrap their cooked HTML in a paragraph; flatten it so a chip
+  // stays on one line while keeping emoji images and inline links.
+  function boostText(html) {
+    const holder = element("span", "boost-text");
+    holder.append(forum.cooked(html));
+    for (const block of [...holder.children].filter(child => child.tagName === "P")) {
+      const nodes = [...block.childNodes];
+      block.remove();
+      holder.append(...nodes);
+    }
+    return holder;
+  }
+
+  function boostList(post) {
+    const list = globalThis.LDDiscussion.boosts(post);
+    if (!list.length) return null;
+    const wrap = element("div", "post-boosts");
+    wrap.setAttribute("role", "list");
+    wrap.setAttribute("aria-label", `表情评论 ${list.length} 条`);
+    for (const boost of list) {
+      const chip = add(element("span", "boost"), avatar(boost.user, 24), boostText(boost.cooked));
+      chip.setAttribute("role", "listitem");
+      if (boost.user?.username) chip.setAttribute("title", `@${boost.user.username}`);
+      if (boost.can_delete && Number.isSafeInteger(boost.id)) {
+        const remove = button("删除这条表情评论", "delete-boost", {
+          className: "boost-delete", iconOnly: true, symbol: "close", value: boost.id
+        });
+        remove.dataset.post = String(post.post_number);
+        chip.append(remove);
+      }
+      wrap.append(chip);
+    }
+    return wrap;
+  }
+
+  // The original only offers a boost input on posts that have no boost yet, and
+  // the server enforces the same limit.
+  function boostTrigger(post) {
+    if (!canBoost(post)) return null;
+    const row = element("div", "post-boost-actions");
+    const control = button("表情评论", "boost-compose", {
+      className: "boost-action", symbol: "rocket", value: Number.isSafeInteger(post.post_number) ? post.post_number : 0
+    });
+    control.setAttribute("title", `给这个帖子加一句表情评论（最多 ${boostMaxVisible} 个字、${boostMaxEmoji} 个表情）`);
+    row.append(control);
+    return row;
+  }
+
+  function boostRaw(editor) {
+    let raw = "";
+    const walk = node => {
+      for (const child of node?.childNodes || []) {
+        if (typeof child === "string") raw += child;
+        else if (child.nodeType === 3) raw += child.textContent;
+        else if (child.tagName === "IMG") raw += child.dataset?.emoji ? `:${child.dataset.emoji}:` : child.alt || "";
+        else if (child.tagName === "BR") raw += " ";
+        else {
+          if (raw && /^(DIV|P)$/.test(child.tagName || "") && !raw.endsWith(" ")) raw += " ";
+          walk(child);
+        }
+      }
+    };
+    walk(editor);
+    return raw.replace(/\s+/g, " ").trim();
+  }
+
+  function boostStats(raw) {
+    let emoji = 0;
+    const withoutCodes = raw.replace(/:([a-z0-9_+-]+):/gi, () => { emoji += 1; return "\uFFFC"; });
+    let segments;
+    try {
+      segments = typeof Intl?.Segmenter === "function"
+        ? [...new Intl.Segmenter("zh", { granularity: "grapheme" }).segment(withoutCodes)].map(item => item.segment)
+        : Array.from(withoutCodes);
+    } catch { segments = Array.from(withoutCodes); }
+    for (const segment of segments) if (/\p{Extended_Pictographic}/u.test(segment)) emoji += 1;
+    return { visible: segments.length, emoji };
+  }
+
+  function focusBoostEditor(editor) {
+    editor.focus?.({ preventScroll: true });
+    try {
+      const range = document.createRange();
+      range.selectNodeContents(editor);
+      range.collapse(false);
+      const selection = window.getSelection();
+      selection.removeAllRanges();
+      selection.addRange(range);
+    } catch {}
+  }
+
+  function insertBoostEmoji(editor, name) {
+    const source = emojiSource(name);
+    if (!source) return;
+    const image = element("img", "emoji");
+    image.dataset.emoji = name;
+    image.alt = `:${name}:`;
+    image.setAttribute("title", `:${name}:`);
+    image.src = source;
+    editor.append(image);
+    try { editor.dispatchEvent(new Event("input", { bubbles: true })); } catch {}
+    focusBoostEditor(editor);
+  }
+
+  function boostComposer(post) {
+    const wrapper = element("div", "boost-composer");
+    wrapper.append(element("h3", "popup-label", post.username ? `表情评论 @${post.username}` : "表情评论"));
+    const editor = element("div", "boost-editor");
+    editor.id = "boost-editor";
+    editor.setAttribute("contenteditable", "true");
+    editor.setAttribute("role", "textbox");
+    editor.setAttribute("aria-label", "表情评论内容");
+    editor.setAttribute("aria-multiline", "false");
+    editor.setAttribute("data-placeholder", "说点什么… 可插入表情");
+    wrapper.append(editor);
+    const groups = new Map();
+    for (const emoji of emojiSources().list) {
+      if (!groups.has(emoji.group)) groups.set(emoji.group, []);
+      groups.get(emoji.group).push(emoji);
+    }
+    const palette = element("div", "boost-palette");
+    palette.setAttribute("aria-label", "可选表情");
+    if (!groups.size) palette.append(element("p", "popup-empty", "没有可用的自定义表情，可以直接输入表情。"));
+    for (const [group, list] of groups) {
+      palette.append(element("h4", "boost-emoji-group", group));
+      const grid = element("div", "boost-emoji-grid");
+      for (const emoji of list) {
+        const item = button("", "boost-emoji", { className: "boost-emoji", value: emoji.name });
+        item.setAttribute("title", `:${emoji.name}:`);
+        item.setAttribute("aria-label", `插入 :${emoji.name}:`);
+        const image = element("img");
+        image.alt = "";
+        image.loading = "lazy";
+        image.src = emojiSource(emoji.name) || "";
+        item.append(image);
+        grid.append(item);
+      }
+      palette.append(grid);
+    }
+    wrapper.append(palette);
+    const footer = element("div", "boost-footer");
+    const counter = element("span", "boost-counter", `0/${boostMaxVisible}`);
+    counter.id = "boost-counter";
+    const cancel = button("取消", "boost-cancel", { className: "secondary-button" });
+    const submit = button("发布", "boost-submit", { className: "boost-submit" });
+    submit.disabled = true;
+    footer.append(counter, cancel, submit);
+    wrapper.append(footer);
+    const update = () => {
+      const stats = boostStats(boostRaw(editor));
+      const over = stats.visible > boostMaxVisible || stats.emoji > boostMaxEmoji;
+      counter.textContent = `${stats.visible}/${boostMaxVisible}${stats.emoji ? ` · 表情 ${stats.emoji}/${boostMaxEmoji}` : ""}`;
+      counter.classList.toggle("over", over);
+      submit.disabled = !stats.visible || over;
+      editor.dataset.empty = stats.visible ? "false" : "true";
+    };
+    editor.addEventListener("input", update);
+    editor.addEventListener("paste", event => {
+      event.preventDefault();
+      const text = String(event.clipboardData?.getData("text/plain") || "").replace(/\s+/g, " ").trim().slice(0, 200);
+      if (text) document.execCommand?.("insertText", false, text);
+    });
+    editor.addEventListener("keydown", event => {
+      // Enter confirms an IME candidate for Chinese input instead of submitting.
+      if (event.isComposing || event.keyCode === 229) return;
+      if (event.key === "Enter") {
+        event.preventDefault();
+        void submitBoost(post.post_number);
+      }
+    });
+    editor.dataset.empty = "true";
+    return wrapper;
+  }
+
+  async function submitBoost(floor) {
+    const detail = state.detail;
+    const post = postByFloor(floor);
+    if (!detail || !post || !canBoost(post) || detail.boostBusy) return;
+    if (!state.user) { notify("请先登录 Linux.do 后再表情评论。"); return; }
+    const editor = $("#boost-editor");
+    const raw = editor ? boostRaw(editor) : "";
+    const stats = boostStats(raw);
+    if (!raw) return;
+    if (stats.visible > boostMaxVisible || stats.emoji > boostMaxEmoji) {
+      notify(`表情评论最多 ${boostMaxVisible} 个字、${boostMaxEmoji} 个表情。`);
+      return;
+    }
+    detail.boostBusy = true;
+    for (const control of root.querySelectorAll('[data-action="boost-submit"], [data-action="boost-cancel"], [data-action="boost-emoji"]')) control.disabled = true;
+    try {
+      const response = await forum.change(`/discourse-boosts/posts/${Number(post.id)}/boosts.json`, "POST", { raw });
+      if (state.detail !== detail) return;
+      post.boosts = [...(Array.isArray(post.boosts) ? post.boosts : []), response];
+      post.can_boost = false;
+      closeMenu();
+      notify("表情评论已发布");
+    } catch (error) {
+      if (state.detail !== detail) return;
+      notify(error.message);
+      pauseForWrite(error, detail);
+    } finally {
+      detail.boostBusy = false;
+      if (state.detail !== detail) return;
+      for (const control of root.querySelectorAll('[data-action="boost-submit"], [data-action="boost-cancel"], [data-action="boost-emoji"]')) control.disabled = false;
+      renderPostFloor(floor);
+    }
+  }
+
+  async function deleteBoost(boostId) {
+    const detail = state.detail;
+    if (!detail || detail.boostBusy || !Number.isSafeInteger(boostId)) return;
+    if (!state.user) { notify("请先登录 Linux.do。"); return; }
+    const post = [...detail.posts.values()].find(item => (Array.isArray(item.boosts) ? item.boosts : []).some(boost => boost.id === boostId));
+    if (!post) return;
+    detail.boostBusy = true;
+    for (const control of root.querySelectorAll('[data-action="delete-boost"]')) control.disabled = true;
+    try {
+      await forum.change(`/discourse-boosts/boosts/${boostId}.json`, "DELETE");
+      if (state.detail !== detail) return;
+      post.boosts = post.boosts.filter(boost => boost.id !== boostId);
+      if (!post.boosts.length) post.can_boost = true;
+      notify("已删除表情评论");
+    } catch (error) {
+      if (state.detail !== detail) return;
+      notify(error.message);
+      pauseForWrite(error, detail);
+    } finally {
+      detail.boostBusy = false;
+      if (state.detail === detail) renderPostFloor(post.post_number);
+    }
+  }
+
+  const relatedLimit = 5;
+
+  // Only inbound references are listed, matching the original post-links box;
+  // outbound links stay inline in the cooked post instead.
+  function linkList(post) {
+    const links = globalThis.LDDiscussion.relatedLinks(post);
+    if (!links.length) return null;
+    const floor = post.post_number;
+    const expanded = !!state.detail?.expandedLinks?.has(floor);
+    const hidden = Math.max(0, links.length - relatedLimit);
+    const container = element("div", "post-links");
+    container.setAttribute("role", "group");
+    container.setAttribute("aria-label", "相关链接");
+    const list = element("ul", "post-links-list");
+    for (const link of expanded ? links : links.slice(0, relatedLimit)) {
+      const url = forum.safeURL(link.url);
+      const row = element("li", "post-link-row");
+      const item = element("a", "post-link");
+      if (url) {
+        item.href = url.href;
+        item.target = "_blank";
+        item.rel = "noopener noreferrer";
+      }
+      item.append(icon("link"), element("span", "post-link-title", link.title));
+      if (link.clicks) item.append(element("span", "post-link-count", number.format(link.clicks)));
+      item.setAttribute("title", (url?.href || link.url) + (link.clicks ? ` · 被点击 ${link.clicks} 次` : ""));
+      row.append(item);
+      list.append(row);
+    }
+    container.append(list);
+    if (hidden) {
+      const toggle = button(expanded ? "收起相关链接" : `其他 ${hidden} 个`, "post-links", {
+        className: "post-links-more", value: floor
+      });
+      toggle.setAttribute("aria-expanded", String(expanded));
+      container.append(toggle);
+    }
+    return container;
+  }
+
+  function postExtras(post) {
+    if (!post || globalThis.LDDiscussion.postState(post) !== "available") return [];
+    return [boostList(post), boostTrigger(post), linkList(post)].filter(Boolean);
+  }
+
   function mount() {
     host = element("div");
     host.id = "linux-do-reader-extension";
@@ -439,7 +997,7 @@
       if (!data.post_stream?.posts?.length) throw new Error("原站未返回可阅读的楼层。");
       const posts = new Map(data.post_stream.posts.map(post => [post.id, post]));
       const stream = data.post_stream.stream || [...posts.keys()];
-      state.detail = { data, stream, posts, attempted: new Set(posts.keys()), collapsed: new Set(), controller,
+      state.detail = { data, stream, posts, attempted: new Set(posts.keys()), collapsed: new Set(), expandedLinks: new Set(), controller,
         pendingFloor: initialFloor || null, moreBusy: false, sort: "oldest", retryAt: 0 };
       resetReplyPager(state.detail);
       rememberTags(data.tags);
@@ -690,7 +1248,10 @@
     const tags = (data.tags || []).slice(0, 12);
     if (tags.length) header.append(add(element("div", "chips article-tags"), ...tags.map(tag => tagPill(tag))));
     const mainPost = add(element("article", "op-content"), postContent(op));
-    if (op) mainPost.dataset.postNumber = op.post_number;
+    if (op) {
+      mainPost.dataset.postNumber = op.post_number;
+      mainPost.append(...postExtras(op), postControls(detail, op));
+    }
     content.append(header, mainPost);
     if (detail.pendingFloor && ![...detail.posts.values()].some(post => post.post_number === detail.pendingFloor)) {
       content.append(anchor(`在原站查看 #${detail.pendingFloor}`, forum.topicPath(data, detail.pendingFloor), "secondary-button", "out"));
@@ -765,7 +1326,6 @@
       if (!placeholder) article.dataset.postNumber = floor;
       const meta = add(element("div", "reply-meta"),
         post.created_at ? date(post.created_at, true) : null,
-        postState === "available" ? stat("heart", "点赞", discussion.likeCount(post)) : null,
         anchor("#" + floor, forum.topicPath(data, floor), "floor"));
       if (depth > 3) meta.prepend(element("span", "depth-label", `层级 ${depth + 1}`));
       const head = add(element("div", "reply-header"), replyPerson(post, post.user_id != null && post.user_id === data.user_id), meta);
@@ -777,7 +1337,9 @@
         article.append(related);
       }
       article.append(postContent(post));
-      if (postState === "available") article.append(add(element("div", "post-actions"), replyButton(detail, post)));
+      if (postState === "available") {
+        article.append(...postExtras(post), postControls(detail, post));
+      }
       if (placeholder) article.append(anchor(`在原站查看 #${floor}`, forum.topicPath(data, floor), "parent-ref", "out"));
       if (!expanded && children.length) article.append(button(`展开 ${children.length} 条直属回复`, "branch", {
         className: "collapsed-children", value: floor, symbol: "down"
@@ -1072,25 +1634,54 @@
         menu.append(select);
       }
     }
+    if (name === "reactions") {
+      const post = state.openMenu?.context?.post;
+      if (!post) return;
+      menu.append(element("h3", "popup-label", "表情回应"));
+      const grid = element("div", "reaction-picker");
+      const mine = post.current_user_reaction;
+      for (const id of reactionIds(post)) {
+        const choice = button("", "react", { className: "reaction-choice", value: id });
+        choice.dataset.post = String(post.post_number);
+        choice.setAttribute("title", `:${id}:`);
+        choice.setAttribute("aria-label", `回应 :${id}:`);
+        choice.append(emojiImage(id, 22, "reaction-emoji"));
+        const selected = mine?.id === id;
+        if (selected) {
+          choice.classList.add("checked");
+          choice.setAttribute("aria-pressed", "true");
+          if (mine.can_undo === false) choice.disabled = true;
+        }
+        grid.append(choice);
+      }
+      menu.append(grid, element("p", "popup-empty", "点击即回应，再点同一个表情可取消。"));
+    }
+    if (name === "boost") {
+      const post = state.openMenu?.context?.post;
+      if (!post) return;
+      menu.append(boostComposer(post));
+    }
   }
 
-  function openMenu(name, trigger) {
+  function openMenu(name, trigger, context = null) {
     closeSidebar();
     const wasOpen = state.openMenu?.trigger === trigger;
     closeMenu();
     if (wasOpen) return;
-    state.openMenu = { name, trigger };
+    state.openMenu = { name, trigger, context };
     trigger.setAttribute("aria-expanded", "true");
     populateMenu(name);
     const menu = $("#menu");
     const { left, right, bottom } = trigger.getBoundingClientRect();
-    const width = Math.min(298, innerWidth - 24);
+    const width = Math.min(context?.width || 298, innerWidth - 24);
     menu.style.width = width + "px";
     menu.style.left = Math.max(12, Math.min(left > innerWidth / 2 ? right - width : left, innerWidth - width - 12)) + "px";
     menu.style.top = bottom + 8 + "px";
     menu.style.maxHeight = Math.max(160, innerHeight - bottom - 20) + "px";
     menu.hidden = false;
-    (menu.querySelector("input") || menu.querySelector("button, a"))?.focus({ preventScroll: true });
+    const focusable = menu.querySelector("input") || menu.querySelector("[contenteditable]") || menu.querySelector("button") || menu.querySelector("a");
+    focusable?.focus({ preventScroll: true });
+    if (focusable?.getAttribute?.("contenteditable") === "true") focusBoostEditor(focusable);
   }
 
   function nativeSidebarButton() {
@@ -1232,6 +1823,54 @@
       case "bookmark": changeBookmark(); break;
       case "level": closeMenu(true); changeLevel(Number(value)); break;
       case "jump": focusPost(Number(value)); break;
+      case "post-links": {
+        const detail = state.detail;
+        const floor = Number(value);
+        if (!detail || !Number.isSafeInteger(floor)) break;
+        const post = [...detail.posts.values()].find(item => item.post_number === floor);
+        const current = control.closest(".post-links");
+        if (!post || !current) break;
+        const expanded = detail.expandedLinks ||= new Set();
+        if (expanded.has(floor)) expanded.delete(floor);
+        else expanded.add(floor);
+        const replacement = linkList(post);
+        if (replacement) current.replaceWith(replacement);
+        else current.remove();
+        replacement?.querySelector(".post-links-more")?.focus({ preventScroll: true });
+        break;
+      }
+      case "react": {
+        const floor = Number(control.dataset.post || 0);
+        const reaction = String(control.dataset.reaction || value || "");
+        if (state.openMenu) closeMenu(true);
+        void toggleReaction(floor, reaction);
+        break;
+      }
+      case "react-picker": {
+        const post = postByFloor(Number(value));
+        if (!post) break;
+        openMenu("reactions", control, { post, width: 276 });
+        break;
+      }
+      case "boost-compose": {
+        const post = postByFloor(Number(value));
+        if (!post || !canBoost(post)) break;
+        if (!state.user) { notify("请先登录 Linux.do 后再表情评论。"); break; }
+        openMenu("boost", control, { post, width: 332 });
+        break;
+      }
+      case "boost-emoji": {
+        const editor = $("#boost-editor");
+        if (editor) insertBoostEmoji(editor, String(value || ""));
+        break;
+      }
+      case "boost-submit": {
+        const floor = Number(state.openMenu?.context?.post?.post_number || 0);
+        void submitBoost(floor);
+        break;
+      }
+      case "boost-cancel": closeMenu(true); break;
+      case "delete-boost": void deleteBoost(Number(value)); break;
       case "branch": {
         const floor = Number(value);
         const collapsed = state.detail.collapsed;
