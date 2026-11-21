@@ -467,6 +467,8 @@
   const allowed = new Set("P DIV SPAN SMALL SUP SUB B STRONG EM I U S DEL INS MARK BR HR BLOCKQUOTE ASIDE HEADER H1 H2 H3 H4 H5 H6 PRE CODE KBD UL OL LI DL DT DD TABLE THEAD TBODY TFOOT TR TD TH A IMG DETAILS SUMMARY FIGURE FIGCAPTION VIDEO AUDIO SOURCE INPUT".split(" "));
   const discard = new Set("SCRIPT STYLE TEMPLATE NOSCRIPT IFRAME OBJECT EMBED SVG MATH BUTTON FORM SELECT TEXTAREA".split(" "));
 
+  const previewExcluded = ".emoji, .emoji-custom, .avatar, .avatar-wrapper, .onebox, .onebox-body, .onebox-header, .onebox-avatar, .onebox-icon, .site-icon, .favicon, .logo";
+
   function cooked(html) {
     const template = document.createElement("template");
     template.innerHTML = html || "";
@@ -497,7 +499,18 @@
           target.alt = source.alt;
           target.loading = "lazy";
           target.referrerPolicy = "no-referrer";
-          if (source.classList.contains("emoji")) target.className = "emoji";
+          if (source.classList.contains("emoji") || source.classList.contains("emoji-custom")) target.className = "emoji";
+          // Recreate only our own metadata; never copy source data-* attributes.
+          // Icons and oneboxes keep their original link behavior, and ordinary
+          // images inside non-image links must not hijack navigation.
+          const link = source.closest("a");
+          const original = safeURL(link?.getAttribute("href"));
+          const lightbox = link?.classList.contains("lightbox");
+          const imageLink = original?.protocol === "https:" &&
+            (lightbox || original.href === media.href || /\.(?:avif|gif|jpe?g|png|svg|webp)$/i.test(original.pathname));
+          if (!source.closest(previewExcluded) && (!link || imageLink)) {
+            target.dataset.ldImageSrc = imageLink ? original.href : media.href;
+          }
         }
         if (source.matches("video,audio")) {
           target.controls = true;
@@ -517,7 +530,22 @@
       if (source.matches("ol")) target.start = source.start;
       if (source.matches("details")) target.open = source.open;
       source.childNodes.forEach(child => copy(child, target));
-      parent.append(target);
+      if (source.matches("a") && target.querySelector("img[data-ld-image-src]")) {
+        const original = safeURL(source.getAttribute("href"));
+        if (original?.protocol === "https:") target.dataset.ldImageLink = original.href;
+      }
+      if (source.matches("img") && target.dataset.ldImageSrc && !source.closest("a")) {
+        // A real anchor preserves native Ctrl/Cmd/Shift-click, middle click,
+        // keyboard access, and the context-menu action for the original image.
+        const link = document.createElement("a");
+        link.href = target.dataset.ldImageSrc;
+        link.target = "_blank";
+        link.rel = "noopener noreferrer";
+        link.dataset.ldImageLink = target.dataset.ldImageSrc;
+        link.title = "点击在当前页面预览图片；按 Ctrl/Cmd 点击打开原图";
+        link.append(target);
+        parent.append(link);
+      } else parent.append(target);
     }
     template.content.childNodes.forEach(child => copy(child, result));
     return result;

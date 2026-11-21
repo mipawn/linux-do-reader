@@ -21,7 +21,7 @@
   const outletClass = "ld-reader-active";
   let host, root, listRequest, topicRequest, outlet, modeSwitch, nativeHeader, headerObserver, listPager, replyPager;
   let pendingOpen = false, readerMode = true, originalLocation, originalPosition, contextLoaded = false;
-  let nativeClient, contextRequest;
+  let nativeClient, contextRequest, imagePreview;
   let recoveryTimer;
   let headerLogo;
   const $ = (selector) => root.querySelector(selector);
@@ -211,15 +211,25 @@
     const ids = [];
     const seen = new Set();
     const push = id => { if (typeof id === "string" && id && !seen.has(id)) { seen.add(id); ids.push(id); } };
-    const valid = state.detail?.data?.valid_reactions;
+    const configured = readerSettings().discourse_reactions_enabled_reactions;
+    const valid = typeof configured === "string" ? configured.split("|") : state.detail?.data?.valid_reactions;
     for (const id of Array.isArray(valid) ? valid : []) push(id);
-    for (const reaction of globalThis.LDDiscussion.reactionSummary(post).reactions) push(reaction.id);
-    push(mainReactionId());
+    const main = mainReactionId();
+    if (!seen.has(main)) ids.unshift(main);
     return ids;
   }
 
   function reactionInteractive(post) {
-    return !!post && !post.yours && globalThis.LDDiscussion.postState(post) === "available";
+    return !!post && !post.yours && !(state.user && post.user_id === state.user.id) &&
+      globalThis.LDDiscussion.postState(post) === "available";
+  }
+
+  function reactionAllowed(post) {
+    if (!reactionInteractive(post) || state.detail?.data?.archived || post.topic?.archived) return false;
+    if (post.current_user_reaction?.can_undo === false) return false;
+    if (!state.user) return !state.detail?.data?.closed && !post.topic?.closed;
+    const like = Array.isArray(post.actions_summary) ? post.actions_summary.find(action => Number(action?.id) === 2) : null;
+    return !like || like.can_act !== false || like.can_undo === true;
   }
 
   function reactionSummary(post) {
@@ -247,11 +257,77 @@
     return bar;
   }
 
+  let interactionHoverTimer, interactionCloseTimer, interactionTouch;
+
+  function clearInteractionTimers() {
+    clearTimeout(interactionHoverTimer);
+    clearTimeout(interactionCloseTimer);
+    clearTimeout(interactionTouch?.timer);
+    interactionHoverTimer = interactionCloseTimer = interactionTouch = null;
+  }
+
+  function interactionPointer(event) {
+    const control = event.target.closest?.('[data-action="react"], [data-action="boost-compose"]');
+    const menu = state.openMenu;
+    const popup = $("#menu");
+    if (event.pointerType === "mouse") {
+      if (event.type === "pointerover") {
+        if (popup?.contains(event.target) || menu?.trigger.contains(event.target)) clearTimeout(interactionCloseTimer);
+        if (!control || control.closest("#menu") || control.contains(event.relatedTarget) || control.disabled ||
+            !state.onScreen || (menu?.name === "boost" && popup?.contains(root.activeElement))) return;
+        const post = postByFloor(Number(control.dataset.post || control.dataset.value));
+        const isBoost = control.dataset.action === "boost-compose";
+        if (!post || (isBoost ? !canBoost(post) || !state.user : !reactionAllowed(post) || readerSettings().enable_emoji === false)) return;
+        if (menu?.trigger === control) return;
+        clearTimeout(interactionCloseTimer);
+        clearTimeout(interactionHoverTimer);
+        const detail = state.detail;
+        interactionHoverTimer = setTimeout(() => {
+          if (state.detail === detail && state.onScreen && control.isConnected && !control.disabled) {
+            openMenu(isBoost ? "boost" : "reactions", control, { post, width: isBoost ? 332 : 276, focus: false });
+          }
+        }, isBoost ? 200 : 100);
+      } else if (event.type === "pointerout") {
+        if (control && !control.contains(event.relatedTarget)) clearTimeout(interactionHoverTimer);
+        if (!menu || !["boost", "reactions"].includes(menu.name) ||
+            (!menu.trigger.contains(event.target) && !popup?.contains(event.target)) ||
+            menu.trigger.contains(event.relatedTarget) || popup?.contains(event.relatedTarget) ||
+            (menu.name === "boost" && popup?.contains(root.activeElement))) return;
+        clearTimeout(interactionCloseTimer);
+        interactionCloseTimer = setTimeout(() => { if (state.openMenu === menu) closeMenu(); }, 500);
+      }
+      return;
+    }
+    if (event.type === "pointerdown") {
+      clearTimeout(interactionTouch?.timer);
+      interactionTouch = null;
+      if (!control || control.dataset.action !== "react" || control.closest("#menu") || control.disabled || !state.onScreen) return;
+      const post = postByFloor(Number(control.dataset.post));
+      if (!reactionAllowed(post) || readerSettings().enable_emoji === false) return;
+      const detail = state.detail;
+      const touch = { control, x: event.clientX, y: event.clientY };
+      touch.timer = setTimeout(() => {
+        if (interactionTouch === touch && state.detail === detail && state.onScreen && control.isConnected) {
+          touch.fired = true;
+          control._readerLongPressUntil = Date.now() + 1000;
+          openMenu("reactions", control, { post, width: 276, focus: false });
+        }
+      }, 400);
+      interactionTouch = touch;
+    } else if (["pointerup", "pointercancel"].includes(event.type) ||
+        (event.type === "pointermove" && interactionTouch && Math.hypot(event.clientX - interactionTouch.x, event.clientY - interactionTouch.y) > 10)) {
+      clearTimeout(interactionTouch?.timer);
+      if (interactionTouch?.fired) interactionTouch.control._readerLongPressUntil = Date.now() + 1000;
+      interactionTouch = null;
+    }
+  }
+
   function reactionActions(detail, post) {
     if (!reactionInteractive(post)) return [];
     const floor = Number.isSafeInteger(post.post_number) ? post.post_number : 0;
     const mine = post.current_user_reaction && typeof post.current_user_reaction === "object" ? post.current_user_reaction : null;
     const undoable = !mine || mine.can_undo !== false;
+    const allowed = reactionAllowed(post);
     const busy = detail?.reactionBusyFloors instanceof Set && detail.reactionBusyFloors.has(floor);
     const main = mainReactionId();
     const toggle = button("", "react", {
@@ -262,24 +338,23 @@
     toggle.dataset.reaction = mine?.id || main;
     toggle.append(mine?.id && mine.id !== main ? emojiImage(mine.id, 18, "reaction-emoji") : icon("heart"));
     toggle.setAttribute("aria-pressed", String(!!mine));
-    const title = mine ? (undoable ? "取消你的表情回应" : "现在不能取消这个表情回应") : "点赞此帖子";
+    const title = !allowed ? (mine && !undoable ? "现在不能取消这个表情回应" : "现在不能表情回应") :
+      mine ? "取消你的表情回应" : "点赞此帖子";
     toggle.setAttribute("title", title);
     toggle.setAttribute("aria-label", title);
-    toggle.disabled = !undoable;
+    toggle.disabled = !allowed;
     if (busy) {
       toggle.setAttribute("aria-busy", "true");
       toggle.setAttribute("aria-disabled", "true");
     }
 
-    const picker = button("选择表情回应", "react-picker", {
-      className: "reaction-action reaction-picker-open" + (busy ? " busy" : ""),
-      iconOnly: true,
-      symbol: "plus",
-      value: floor
-    });
-    picker.disabled = busy;
-    picker.setAttribute("aria-expanded", "false");
-    return [toggle, picker];
+    if (readerSettings().enable_emoji !== false) {
+      toggle.setAttribute("aria-haspopup", "dialog");
+      toggle.setAttribute("aria-expanded", "false");
+      toggle.setAttribute("aria-keyshortcuts", "ArrowDown");
+      toggle.setAttribute("aria-description", "悬停或长按选择表情；键盘按下箭头打开选择面板。");
+    }
+    return [toggle];
   }
 
   function postControls(detail, post) {
@@ -381,6 +456,8 @@
       notify(mine.id === reaction ? "现在不能取消这个表情回应。" : "现在不能更换这个表情回应。");
       return;
     }
+    if (!reactionAllowed(post)) { notify("现在不能表情回应。"); return; }
+    if (!reactionIds(post).includes(reaction) && readerSettings().discourse_reactions_allow_any_emoji !== true && mine?.id !== reaction) return;
     const snapshot = postFieldSnapshot(post);
     busy.add(floor);
     applyOptimisticReaction(post, reaction);
@@ -405,7 +482,8 @@
   const boostMaxEmoji = 5;
 
   function canBoost(post) {
-    return !!post && post.can_boost === true && !(Array.isArray(post.boosts) && post.boosts.length);
+    // can_boost is viewer-specific authority, not a whole-post single-boost limit.
+    return !!post && post.can_boost === true && globalThis.LDDiscussion.postState(post) === "available";
   }
 
   // Boost bubbles wrap their cooked HTML in a paragraph; flatten it so a chip
@@ -440,18 +518,29 @@
       }
       wrap.append(chip);
     }
+    const trigger = boostTrigger(post, true);
+    if (trigger) {
+      const item = element("span", "boost-add");
+      item.setAttribute("role", "listitem");
+      item.append(trigger);
+      wrap.append(item);
+    }
     return wrap;
   }
 
-  // The original only offers a boost input on posts that have no boost yet, and
-  // the server enforces the same limit.
-  function boostTrigger(post) {
-    if (!canBoost(post)) return null;
-    const row = element("div", "post-boost-actions");
+  // Native uses the action row for empty posts and a list-tail entry once other
+  // people have boosted. Both entries share the same viewer-specific permission.
+  function boostTrigger(post, inList = false) {
+    if (!canBoost(post) || (!inList && globalThis.LDDiscussion.boosts(post).length)) return null;
     const control = button("表情评论", "boost-compose", {
       className: "boost-action", symbol: "rocket", value: Number.isSafeInteger(post.post_number) ? post.post_number : 0
     });
+    control.disabled = !!state.detail?.boostBusy;
+    control.setAttribute("aria-haspopup", "dialog");
+    control.setAttribute("aria-expanded", "false");
     control.setAttribute("title", `给这个帖子加一句表情评论（最多 ${boostMaxVisible} 个字、${boostMaxEmoji} 个表情）`);
+    if (inList) return control;
+    const row = element("div", "post-boost-actions");
     row.append(control);
     return row;
   }
@@ -499,15 +588,34 @@
     } catch {}
   }
 
+  function updateBoostComposer(editor) {
+    const stats = boostStats(boostRaw(editor));
+    const busy = !!state.detail?.boostBusy;
+    const over = stats.visible > boostMaxVisible || stats.emoji > boostMaxEmoji;
+    const counter = $("#boost-counter");
+    if (counter) {
+      counter.textContent = `${stats.visible}/${boostMaxVisible}${stats.emoji ? ` · 表情 ${stats.emoji}/${boostMaxEmoji}` : ""}`;
+      counter.classList.toggle("over", over);
+    }
+    const submit = $('[data-action="boost-submit"]');
+    if (submit) submit.disabled = busy || !stats.visible || over;
+    editor.dataset.empty = stats.visible ? "false" : "true";
+    const canAddEmoji = stats.visible + (stats.visible ? 2 : 1) <= boostMaxVisible && stats.emoji < boostMaxEmoji;
+    for (const control of root.querySelectorAll('[data-action="boost-emoji"]')) control.disabled = busy || !canAddEmoji;
+  }
+
   function insertBoostEmoji(editor, name) {
     const source = emojiSource(name);
-    if (!source) return;
+    const stats = boostStats(boostRaw(editor));
+    if (!source || state.detail?.boostBusy || stats.visible + (stats.visible ? 2 : 1) > boostMaxVisible || stats.emoji >= boostMaxEmoji) return;
+    if (stats.visible) editor.append(" ");
     const image = element("img", "emoji");
     image.dataset.emoji = name;
     image.alt = `:${name}:`;
     image.setAttribute("title", `:${name}:`);
     image.src = source;
     editor.append(image);
+    updateBoostComposer(editor);
     try { editor.dispatchEvent(new Event("input", { bubbles: true })); } catch {}
     focusBoostEditor(editor);
   }
@@ -556,15 +664,9 @@
     submit.disabled = true;
     footer.append(counter, cancel, submit);
     wrapper.append(footer);
-    const update = () => {
-      const stats = boostStats(boostRaw(editor));
-      const over = stats.visible > boostMaxVisible || stats.emoji > boostMaxEmoji;
-      counter.textContent = `${stats.visible}/${boostMaxVisible}${stats.emoji ? ` · 表情 ${stats.emoji}/${boostMaxEmoji}` : ""}`;
-      counter.classList.toggle("over", over);
-      submit.disabled = !stats.visible || over;
-      editor.dataset.empty = stats.visible ? "false" : "true";
-    };
+    const update = event => { if (!event?.isComposing) updateBoostComposer(editor); };
     editor.addEventListener("input", update);
+    editor.addEventListener("compositionend", update);
     editor.addEventListener("paste", event => {
       event.preventDefault();
       const text = String(event.clipboardData?.getData("text/plain") || "").replace(/\s+/g, " ").trim().slice(0, 200);
@@ -612,6 +714,7 @@
       detail.boostBusy = false;
       if (state.detail !== detail) return;
       for (const control of root.querySelectorAll('[data-action="boost-submit"], [data-action="boost-cancel"], [data-action="boost-emoji"]')) control.disabled = false;
+      if (editor?.isConnected) updateBoostComposer(editor);
       renderPostFloor(floor);
     }
   }
@@ -621,14 +724,17 @@
     if (!detail || detail.boostBusy || !Number.isSafeInteger(boostId)) return;
     if (!state.user) { notify("请先登录 Linux.do。"); return; }
     const post = [...detail.posts.values()].find(item => (Array.isArray(item.boosts) ? item.boosts : []).some(boost => boost.id === boostId));
-    if (!post) return;
+    const boost = post?.boosts.find(item => item.id === boostId);
+    if (!boost || boost.can_delete !== true) return;
+    const own = boost.user?.id === state.user.id;
+    if (!own && !window.confirm?.("确定删除这条表情评论？")) return;
     detail.boostBusy = true;
     for (const control of root.querySelectorAll('[data-action="delete-boost"]')) control.disabled = true;
     try {
       await forum.change(`/discourse-boosts/boosts/${boostId}.json`, "DELETE");
       if (state.detail !== detail) return;
       post.boosts = post.boosts.filter(boost => boost.id !== boostId);
-      if (!post.boosts.length) post.can_boost = true;
+      if (own) post.can_boost = true;
       notify("已删除表情评论");
     } catch (error) {
       if (state.detail !== detail) return;
@@ -694,6 +800,10 @@
     style.rel = "stylesheet";
     style.href = asset("reader.css");
     root.append(style);
+    const previewStyle = element("link");
+    previewStyle.rel = "stylesheet";
+    previewStyle.href = asset("image-preview.css");
+    root.append(previewStyle);
     const shell = element("div", "shell");
     shell.innerHTML = `
       <header class="header">
@@ -726,6 +836,7 @@
       <div id="menu" class="popup" hidden></div>
       <div id="toast" class="toast" role="status" hidden></div>`;
     root.append(shell);
+    imagePreview = globalThis.LDImagePreview?.create({ root, content: () => $("#reading") });
     try {
       const theme = localStorage.getItem("linux-do-reader-theme");
       if (theme === "light" || theme === "dark") host.dataset.theme = theme;
@@ -755,11 +866,12 @@
     );
     root.addEventListener("click", clicked);
     root.addEventListener("keydown", keydown);
+    for (const type of ["pointerover", "pointerout", "pointerdown", "pointerup", "pointercancel", "pointermove"]) {
+      root.addEventListener(type, interactionPointer);
+    }
     root.addEventListener("change", event => {
       if (event.target.id !== "reply-sort" || !state.detail) return;
-      state.detail.sort = event.target.value;
-      renderReplies();
-      $("#reply-sort")?.focus({ preventScroll: true });
+      changeReplySort(event.target.value);
     });
     listPager = new globalThis.LDScroll.Pager({
       viewport: $("#list-scroll"),
@@ -953,6 +1065,8 @@
   }
 
   function clearTopic() {
+    clearInteractionTimers();
+    imagePreview?.close({ restoreFocus: false });
     state.detail?.live?.stop();
     topicRequest?.abort();
     state.selected = null;
@@ -977,6 +1091,8 @@
     if (activate) openTopicInView();
     closeMenu();
     if (state.selected?.id === topic.id && (state.detail || state.topicBusy)) return;
+    clearInteractionTimers();
+    imagePreview?.close({ restoreFocus: false });
     state.detail?.live?.stop();
     topicRequest?.abort();
     const controller = new AbortController();
@@ -1034,7 +1150,10 @@
           if (state.detail !== detail) return;
           detail.liveStatus = live;
           renderLiveStatus();
-          if (!live.busy) replyPager?.check();
+          if (!live.busy) {
+            maybeLoadSortedPage();
+            replyPager?.check();
+          }
           scheduleRecovery();
         },
         onChange: ({ opChanged }) => {
@@ -1262,13 +1381,42 @@
     renderReplies();
   }
 
-  function renderReplies() {
+  // An explicit order change keeps the viewport, not the old floor's location.
+  // Latest also reads one page from the stream's tail, even far from the footer.
+  function changeReplySort(value) {
+    const detail = state.detail;
+    if (!detail || !["oldest", "newest", "top"].includes(value) || detail.sort === value) return;
+    detail.sort = value;
+    detail.sortGeneration = (detail.sortGeneration || 0) + 1;
+    detail.sortLoadPending = value === "newest" && pendingPostIds(detail).length > 0;
+    if (value === "newest" && detail.retryAt <= Date.now()) detail.moreError = null;
+    replyPager?.reset();
+    replyPager?.consumeAutoBudget();
+    renderReplies({ preservePosition: true });
+    $("#reply-sort")?.focus({ preventScroll: true });
+    maybeLoadSortedPage();
+  }
+
+  function maybeLoadSortedPage() {
+    const detail = state.detail;
+    if (!detail?.sortLoadPending || detail.sort !== "newest" || !state.onScreen ||
+        detail.moreBusy || detail.live?.busy || detail.moreError || detail.retryAt > Date.now() || detail.controller.signal.aborted) return;
+    detail.sortLoadPending = false;
+    if (!pendingPostIds(detail).length) return;
+    void loadReplies({ preservePosition: true }).catch(() => {});
+  }
+
+  function renderReplies({ preservePosition = false } = {}) {
     const detail = state.detail;
     const section = $("#reply-section");
     if (!detail || !section) return;
     const { posts, data, collapsed, attempted, stream } = detail;
     const discussion = globalThis.LDDiscussion;
     const viewport = $("#read-scroll");
+    const position = viewport.scrollTop;
+    const keepPosition = preservePosition || !!detail.sortLoading ||
+      detail.renderedSort != null && detail.renderedSort !== detail.sort;
+    detail.renderedSort = detail.sort;
     const bounds = viewport.getBoundingClientRect();
     const visible = [...section.querySelectorAll(".reply-card")].find(node => {
       const rect = node.getBoundingClientRect();
@@ -1296,7 +1444,10 @@
     sortSelect.value = ["oldest", "newest", "top"].includes(detail.sort) ? detail.sort : "oldest";
     tools.append(sortLabel, sortSelect);
     heading.append(tools);
-    const sortNote = element("p", "reply-sort-note", "排序仅基于已加载回复；各分支的同级回复分别排序。");
+    const sortNote = element("p", "reply-sort-note", detail.sort === "newest"
+      ? "优先读取最新回复；各分支的同级回复分别按最新排序。"
+      : detail.sort === "top" ? "点赞排序仅基于已加载回复；各分支的同级回复分别排序。"
+      : "从最早的未加载回复继续读取；各分支的同级回复分别排序。");
     sortNote.id = "reply-sort-note";
     section.replaceChildren(heading, sortNote);
     if (!loaded && !total) section.append(status("还没有回复。"));
@@ -1367,7 +1518,8 @@
     }
     if (detail.moreError) footer.append(element("span", "error", recoveryMessage(detail.moreError, detail.retryAt)));
     section.append(footer);
-    if (anchorFloor) {
+    viewport.scrollTop = position;
+    if (!keepPosition && anchorFloor) {
       const replacement = section.querySelector(`[data-reply-floor="${anchorFloor}"]`);
       if (replacement) viewport.scrollTop += replacement.getBoundingClientRect().top - anchorTop;
     }
@@ -1377,7 +1529,10 @@
   }
 
   function pendingPostIds(detail) {
-    return detail.stream.filter(id => !detail.attempted.has(id) && !detail.live?.hasPending(id));
+    const pending = detail.stream.filter(id => !detail.attempted.has(id) && !detail.live?.hasPending(id));
+    // The topic JSON stream is chronological. Reverse a copy, never its source:
+    // live reconciliation and a later oldest order still use the original stream.
+    return detail.sort === "newest" ? pending.reverse() : pending;
   }
 
   function resetReplyPager(detail) {
@@ -1388,7 +1543,7 @@
       viewport: $("#read-scroll"),
       autoLoadLimit: 1,
       canLoad: () => state.onScreen && state.detail === detail && !detail.moreBusy && !detail.live?.busy && !detail.moreError && pendingPostIds(detail).length > 0,
-      getKey: () => `${detail.data.id}:${pendingPostIds(detail)[0]}`,
+      getKey: () => `${detail.data.id}:${detail.sort}:${pendingPostIds(detail)[0]}`,
       getSentinel: () => $("#reply-section .reply-footer"),
       load: () => loadReplies({ background: true }),
       onStateChange: paging => {
@@ -1400,18 +1555,21 @@
     });
   }
 
-  async function loadReplies({ background = false } = {}) {
+  async function loadReplies({ background = false, preservePosition = false } = {}) {
     const detail = state.detail;
     if (!detail || detail.moreBusy || detail.live?.busy || detail.retryAt > Date.now()) return;
+    const sortGeneration = detail.sortGeneration || 0;
     const previousCount = detail.posts.size;
     const ids = pendingPostIds(detail).slice(0, Math.min(detail.data.chunk_size || 20, 30));
     if (!ids.length) return;
+    if (detail.sort === "newest") detail.sortLoadPending = false;
     if (!background) replyPager?.consumeAutoBudget();
     detail.loadingIds = new Set(ids);
+    detail.sortLoading = preservePosition;
     detail.moreBusy = true;
     detail.moreError = null;
     detail.retryAt = 0;
-    renderReplies();
+    renderReplies({ preservePosition });
     try {
       const posts = await forum.postsPage(detail.data.id, ids, detail.controller.signal, { background });
       if (detail.controller.signal.aborted || state.detail !== detail) return;
@@ -1430,8 +1588,10 @@
     } finally {
       detail.loadingIds.clear();
       detail.moreBusy = false;
+      detail.sortLoading = false;
       if (state.detail === detail) {
-        renderReplies();
+        renderReplies({ preservePosition: preservePosition || sortGeneration !== (detail.sortGeneration || 0) });
+        maybeLoadSortedPage();
         detail.live?.kick();
       }
     }
@@ -1647,11 +1807,9 @@
         choice.setAttribute("aria-label", `回应 :${id}:`);
         choice.append(emojiImage(id, 22, "reaction-emoji"));
         const selected = mine?.id === id;
-        if (selected) {
-          choice.classList.add("checked");
-          choice.setAttribute("aria-pressed", "true");
-          if (mine.can_undo === false) choice.disabled = true;
-        }
+        choice.setAttribute("aria-pressed", String(selected));
+        if (selected) choice.classList.add("checked");
+        choice.disabled = !reactionAllowed(post) || !!state.detail?.reactionBusyFloors?.has(post.post_number);
         grid.append(choice);
       }
       menu.append(grid, element("p", "popup-empty", "点击即回应，再点同一个表情可取消。"));
@@ -1680,8 +1838,10 @@
     menu.style.maxHeight = Math.max(160, innerHeight - bottom - 20) + "px";
     menu.hidden = false;
     const focusable = menu.querySelector("input") || menu.querySelector("[contenteditable]") || menu.querySelector("button") || menu.querySelector("a");
-    focusable?.focus({ preventScroll: true });
-    if (focusable?.getAttribute?.("contenteditable") === "true") focusBoostEditor(focusable);
+    if (context?.focus !== false) {
+      focusable?.focus({ preventScroll: true });
+      if (focusable?.getAttribute?.("contenteditable") === "true") focusBoostEditor(focusable);
+    }
   }
 
   function nativeSidebarButton() {
@@ -1766,11 +1926,22 @@
   }
 
   function clicked(event) {
+    if (imagePreview?.handleClick(event)) { closeMenu(); closeSidebar(); return; }
     const control = event.target.closest("[data-action]");
     const inMenu = event.target.closest("#menu");
     const action = control?.dataset.action;
     const value = control?.dataset.value;
-    if (!inMenu && action !== "menu" && action !== "close-menu") closeMenu();
+    if (control?.disabled || control?.getAttribute("aria-disabled") === "true") return;
+    if (["react", "boost-compose"].includes(action)) {
+      clearTimeout(interactionHoverTimer);
+      clearTimeout(interactionCloseTimer);
+    }
+    if (action === "react" && control._readerLongPressUntil > Date.now()) {
+      control._readerLongPressUntil = 0;
+      event.preventDefault?.();
+      return;
+    }
+    if (!inMenu && !["menu", "close-menu", "boost-compose"].includes(action)) closeMenu();
     if (action !== "sidebar") closeSidebar();
     if (!control) return;
     switch (action) {
@@ -1846,12 +2017,6 @@
         void toggleReaction(floor, reaction);
         break;
       }
-      case "react-picker": {
-        const post = postByFloor(Number(value));
-        if (!post) break;
-        openMenu("reactions", control, { post, width: 276 });
-        break;
-      }
       case "boost-compose": {
         const post = postByFloor(Number(value));
         if (!post || !canBoost(post)) break;
@@ -1884,6 +2049,26 @@
   }
 
   function keydown(event) {
+    if (imagePreview?.handleKeydown(event)) return;
+    if (event.key === "ArrowDown" && !event.defaultPrevented && !event.isComposing &&
+        !event.ctrlKey && !event.metaKey && !event.altKey && !event.shiftKey) {
+      const control = event.target.closest?.('.reaction-action[data-action="react"]');
+      const floor = Number(control?.dataset.value);
+      const post = control && postByFloor(floor);
+      if (state.onScreen && control && root.contains(control) && !control.disabled &&
+          control.getAttribute("aria-disabled") !== "true" && post && reactionAllowed(post) &&
+          !state.detail?.reactionBusyFloors?.has(floor) && readerSettings().enable_emoji !== false) {
+        event.preventDefault();
+        event.stopPropagation();
+        clearInteractionTimers();
+        if (state.openMenu?.name !== "reactions" || state.openMenu.trigger !== control) {
+          openMenu("reactions", control, { post, width: 276 });
+        } else {
+          $("#menu button")?.focus({ preventScroll: true });
+        }
+        return;
+      }
+    }
     if (event.key === "Escape") {
       event.preventDefault();
       event.stopPropagation();
@@ -1988,6 +2173,8 @@
   }
 
   function hideReader(restore = true, preserveMode = false) {
+    clearInteractionTimers();
+    imagePreview?.close({ restoreFocus: false });
     if (!preserveMode) readerMode = false;
     pendingOpen = false;
     clearTimeout(recoveryTimer);

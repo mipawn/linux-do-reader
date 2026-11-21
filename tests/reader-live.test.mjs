@@ -39,7 +39,11 @@ class Node {
   addEventListener() {}
   focus() { if (this.disabled) return; let root = this; while (root.parentNode) root = root.parentNode; root.activeElement = this; }
   scrollIntoView() {}
-  getBoundingClientRect() { return { top: 0, left: 0, bottom: this.id === "read-scroll" ? 600 : 40, right: 600, width: 600, height: this.id === "read-scroll" ? 600 : 40 }; }
+  getBoundingClientRect() {
+    let root = this; while (root.parentNode) root = root.parentNode;
+    if (root.replyGeometry && this.classList.contains("reply-card")) return root.replyGeometry(this);
+    return { top: 0, left: 0, bottom: this.id === "read-scroll" ? 600 : 40, right: 600, width: 600, height: this.id === "read-scroll" ? 600 : 40 };
+  }
   matches(selector) {
     const name = selector.match(/^([a-z]+)/i)?.[1];
     if (name && this.tagName !== name.toUpperCase()) return false;
@@ -135,7 +139,7 @@ function fixture({ posts = [post(1), post(2)], user = { id: 7 }, data: changes =
     updateSteps = renderList = renderFilters = closeMenu = closeSidebar = sizeReader = resetReplyPager = scheduleRecovery = () => {};
     notify = message => __calls.notifications.push(message);
     globalThis.readerTest = { state, renderReading, renderReplies, replyTo, clicked, startTopicLive,
-      pendingPostIds, loadReplies, loadContext, clearTopic, selectTopic, canReply, populateMenu,
+      pendingPostIds, loadReplies, changeReplySort, maybeLoadSortedPage, loadContext, clearTopic, selectTopic, canReply, populateMenu,
       openMenu, toggleReaction, submitBoost, deleteBoost, postByFloor, boostStats };
     const requestedAtStart = false;
   `);
@@ -511,7 +515,8 @@ test("reaction controls render for available posts and stay hidden on own posts"
   f.render();
   const op = f.root.querySelector('.op-content[data-post-number="1"]');
   assert.ok(op.querySelector('[data-action="react"]'));
-  assert.ok(op.querySelector('[data-action="react-picker"]'));
+  assert.equal(op.querySelector('[data-action="react-picker"]'), null);
+  assert.equal(op.querySelector('[data-action="react"]').getAttribute("aria-keyshortcuts"), "ArrowDown");
   assert.equal(op.querySelector(".post-reactions"), null, "zero responses have no read-only summary");
   assert.ok(op.querySelector(".post-controls .post-actions"));
   assert.equal(op.querySelector(".reaction-total"), null);
@@ -553,7 +558,7 @@ const reactionResponse = (count = 1) => ({
   current_user_used_main_reaction: true, actions_summary: [{ id: 2, count, can_act: true }], like_count: count
 });
 const floorCard = (f, floor) => f.root.querySelector(`[data-post-number="${floor}"]`);
-const reactionControls = card => card.querySelectorAll('[data-action="react"], [data-action="react-picker"]');
+const reactionControls = card => card.querySelectorAll('.reaction-action[data-action="react"]');
 const actionUnavailable = control => !!control.disabled || control.getAttribute("aria-disabled") === "true";
 
 test("pending reactions disable only their own floor and allow another floor's explicit action", async () => {
@@ -589,7 +594,7 @@ test("reply reaction completion and failure never leave the OP controls disabled
     await f.api.toggleReaction(2, "heart");
     for (const floor of [1, 2]) {
       const controls = reactionControls(floorCard(f, floor));
-      assert.equal(controls.length, 2);
+      assert.equal(controls.length, 1);
       assert.ok(controls.every(control => !actionUnavailable(control)), `floor ${floor} must recover after ${fails ? "failure" : "success"}`);
     }
     if (fails) assert.match(f.calls.notifications.at(-1), /reaction failed/);
@@ -689,7 +694,7 @@ test("an older floor's reaction response never steals focus from a newer floor's
   }
 });
 
-test("like, picker and reply share a bottom action row with a read-only summary and large hit targets", () => {
+test("main reaction and reply share a bottom action row with a read-only summary and large hit targets", () => {
   const f = fixture({ posts: [post(1, reactionResponse(3)), post(2, reactionResponse(2))] });
   f.render();
   for (const floor of [1, 2]) {
@@ -700,7 +705,7 @@ test("like, picker and reply share a bottom action row with a read-only summary 
     const summary = row.querySelector(".post-reactions");
     assert.ok(summary);
     assert.equal(summary.querySelectorAll("button").length, 0, "counts and sampled emoji are not ambiguous tiny buttons");
-    assert.deepEqual(actions.querySelectorAll("button").map(control => control.dataset.action), ["react", "react-picker", "reply"]);
+    assert.deepEqual(actions.querySelectorAll("button").map(control => control.dataset.action), ["react", "reply"]);
     assert.equal(actions.parentElement, row);
     assert.ok(card.children.indexOf(row) > card.children.indexOf(card.querySelector(".post-content")));
     const toggle = actions.querySelector('[data-action="react"]');
@@ -765,7 +770,7 @@ test("the reaction picker lists valid reactions and marks the current one", asyn
     }
   });
   f.render();
-  const trigger = f.root.querySelector('[data-action="react-picker"]');
+  const trigger = f.root.querySelector('.reaction-action[data-action="react"]');
   f.api.openMenu("reactions", trigger, { post: f.detail.posts.get(101), width: 276 });
   const choices = f.root.querySelectorAll(".reaction-choice");
   assert.equal(choices.length, 3);
@@ -787,7 +792,7 @@ test("boost composer posts the original endpoint contract and adds the boost loc
   f.render();
   const op = f.root.querySelector('.op-content[data-post-number="1"]');
   assert.ok(op.querySelector('[data-action="boost-compose"]'));
-  assert.equal(f.root.querySelector('.reply-card[data-post-number="2"] [data-action="boost-compose"]'), null);
+  assert.ok(f.root.querySelector('.reply-card[data-post-number="2"] [data-action="boost-compose"]'));
   f.api.openMenu("boost", op.querySelector('[data-action="boost-compose"]'), { post: f.detail.posts.get(101), width: 332 });
   const editor = f.root.querySelector("#boost-editor");
   assert.ok(editor);
@@ -847,4 +852,92 @@ test("boost draft stats count shortcodes and emoji as single characters", () => 
   assert.deepEqual(plain(f.api.boostStats(":bili_057:")), { visible: 1, emoji: 1 });
   assert.deepEqual(plain(f.api.boostStats("😆😆")), { visible: 2, emoji: 2 });
   assert.equal(f.api.boostStats("一二三四五六七八九十一二三四五六七八").visible, 18);
+});
+
+const orderedPost = floor => post(floor, { created_at: `2026-11-18T01:${String(floor).padStart(2, "0")}:00Z` });
+function movingReplyGeometry(f) {
+  f.root.replyGeometry = node => {
+    const index = f.root.querySelectorAll(".reply-card").indexOf(node);
+    const top = 200 + index * 120 - f.scroll.scrollTop;
+    return { top, bottom: top + 100, height: 100, left: 0, right: 600, width: 600 };
+  };
+}
+
+test("explicit sort keeps the numeric viewport instead of following the reordered old floor", () => {
+  const f = fixture({ posts: [orderedPost(1), orderedPost(2), orderedPost(3), orderedPost(4)] });
+  movingReplyGeometry(f); f.render(); f.scroll.scrollTop = 100;
+  f.api.changeReplySort("newest");
+  assert.equal(f.scroll.scrollTop, 100);
+  assert.deepEqual(f.root.querySelectorAll(".reply-card").map(node => node.dataset.replyFloor), ["4", "3", "2"]);
+  assert.equal(f.root.activeElement.id, "reply-sort");
+  assert.equal(f.calls.pages.length, 0, "fully loaded topics need no new request");
+  f.api.changeReplySort("oldest");
+  assert.equal(f.scroll.scrollTop, 100);
+  assert.deepEqual(f.root.querySelectorAll(".reply-card").map(node => node.dataset.replyFloor), ["2", "3", "4"]);
+});
+
+test("latest sort fetches the tail page immediately and keeps position through asynchronous content insertion", async () => {
+  let release;
+  const f = fixture({ posts: [orderedPost(1), orderedPost(2), orderedPost(3)], data: { chunk_size: 2, posts_count: 9 },
+    page: () => new Promise(resolve => { release = resolve; }) });
+  f.detail.stream.push(104, 105, 106, 107, 108, 109);
+  movingReplyGeometry(f); f.render(); f.scroll.scrollTop = 90;
+  const stream = [...f.detail.stream];
+  f.api.changeReplySort("newest");
+  assert.equal(f.calls.pages.length, 1);
+  assert.deepEqual(f.calls.pages[0].ids, [109, 108]);
+  assert.equal(f.calls.pages[0].options.background, false);
+  assert.equal(f.scroll.scrollTop, 90);
+  f.api.changeReplySort("newest"); assert.equal(f.calls.pages.length, 1);
+  release([orderedPost(8), orderedPost(9)]); await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(f.scroll.scrollTop, 90);
+  assert.equal(f.detail.sortLoading, false);
+  assert.deepEqual(f.detail.stream, stream);
+  assert.deepEqual(plain(f.api.pendingPostIds(f.detail)), [107, 106, 105, 104]);
+  assert.equal(f.root.querySelectorAll(".reply-card")[0].dataset.replyFloor, "9");
+  f.api.changeReplySort("oldest");
+  assert.deepEqual(plain(f.api.pendingPostIds(f.detail)), [104, 105, 106, 107]);
+});
+
+test("latest sort waits for the existing page without duplicates then reads the newest missing page", async () => {
+  const releases = [];
+  const f = fixture({ data: { chunk_size: 2 }, page: () => new Promise(resolve => releases.push(resolve)) });
+  f.detail.stream.push(103, 104, 105, 106, 107, 108); f.render();
+  const first = f.api.loadReplies();
+  f.api.changeReplySort("newest");
+  assert.deepEqual(f.calls.pages.map(call => call.ids), [[103, 104]]);
+  assert.equal(f.detail.sortLoadPending, true);
+  releases[0]([post(3), post(4)]); await first;
+  assert.deepEqual(f.calls.pages.map(call => call.ids), [[103, 104], [108, 107]]);
+  assert.equal(f.detail.sortLoadPending, false);
+  releases[1]([post(7), post(8)]); await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(f.calls.pages.length, 2);
+});
+
+test("sort intent queued behind live work is canceled by another order or topic close", () => {
+  const f = fixture(); f.detail.stream.push(103, 104); f.live(); f.render();
+  f.detail.live.busy = true;
+  f.api.changeReplySort("newest");
+  assert.equal(f.calls.pages.length, 0); assert.equal(f.detail.sortLoadPending, true);
+  f.api.changeReplySort("oldest"); f.detail.live.busy = false;
+  f.api.maybeLoadSortedPage(); assert.equal(f.calls.pages.length, 0);
+  f.detail.live.busy = true; f.api.changeReplySort("newest"); f.api.clearTopic();
+  f.api.maybeLoadSortedPage(); assert.equal(f.calls.pages.length, 0);
+});
+
+test("latest page failures remain explicit and are not retried by render or subsequent idle status", async () => {
+  const f = fixture({ page: () => { throw new Error("offline latest page"); } });
+  f.detail.stream.push(103, 104); f.render(); f.api.changeReplySort("newest");
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(f.calls.pages.length, 1); assert.match(f.detail.moreError, /offline/);
+  f.api.renderReplies(); f.api.maybeLoadSortedPage();
+  assert.equal(f.calls.pages.length, 1);
+  assert.equal(f.detail.attempted.has(104), false);
+});
+
+test("latest pagination skips unavailable and live-owned ids without reversing the canonical stream", () => {
+  const f = fixture({ livePending: new Set([105]) });
+  f.detail.stream.push(103, 104, 105, 106); f.detail.attempted.add(104); f.detail.sort = "newest"; f.live();
+  assert.deepEqual(plain(f.api.pendingPostIds(f.detail)), [106, 103]);
+  assert.deepEqual(f.detail.stream, [101, 102, 103, 104, 105, 106]);
 });

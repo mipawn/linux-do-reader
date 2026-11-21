@@ -25,6 +25,8 @@ assets = (
     "native.js",
     "reader.js",
     "reader.css",
+    "image-preview.js",
+    "image-preview.css",
     "launcher.css",
     "icon.png",
     "symbols.png",

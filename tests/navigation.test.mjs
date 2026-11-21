@@ -134,7 +134,7 @@ test("extension action opens a new homepage when the tab has no ID", async () =>
 test("manifest and archive contain the strictly scoped native reply/live bridge, not a reading tracker", () => {
   const manifest = JSON.parse(source("manifest.json"));
   assert.equal(manifest.content_scripts.length, 2);
-  assert.deepEqual(manifest.content_scripts[0].js, ["forum.js", "navigation.js", "discussions.js", "scrolling.js", "live.js", "reader.js"]);
+  assert.deepEqual(manifest.content_scripts[0].js, ["forum.js", "navigation.js", "discussions.js", "scrolling.js", "live.js", "image-preview.js", "reader.js"]);
   assert.equal(manifest.content_scripts[0].world, undefined);
   assert.deepEqual(manifest.content_scripts[1].js, ["native.js"]);
   assert.equal(manifest.content_scripts[1].world, "MAIN");
