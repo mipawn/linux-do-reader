@@ -153,10 +153,13 @@
       siblings.sort((a, b) => {
         const tie = a.post.post_number - b.post.post_number;
         if (mode === "top") return likeCount(b.post) - likeCount(a.post) || tie;
+        // Native Nested Replies uses post_number ASC for old, not created_at.
+        // Imported or edited timestamps must not move an early floor later.
+        if (mode === "oldest") return tie;
         const order = dated
           ? Date.parse(a.post.created_at) - Date.parse(b.post.created_at)
           : tie;
-        return (mode === "newest" ? -order : order) || tie;
+        return -order || tie;
       });
       for (const node of siblings) if (node.children.length) groups.push(node.children);
     }

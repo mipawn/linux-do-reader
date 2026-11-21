@@ -36,7 +36,7 @@
   const sourceLabels = Object.freeze({
     presence: "正在回复状态", liveTopic: "实时话题补读", livePosts: "实时楼层更新", live: "实时更新",
     topic: "话题详情", posts: "回复分页", feed: "话题列表", search: "搜索", metadata: "社区元数据",
-    account: "登录状态", csrf: "操作准备", bookmark: "书签操作", notification: "话题通知设置",
+    account: "登录状态", csrf: "操作准备", bookmark: "书签操作", notification: "话题通知设置", poll: "投票操作",
     draft: "原版草稿读取", composer: "原版编辑器", read: "其他读取", write: "其他操作"
   });
   const allowedSources = new Set(Object.values(sourceLabels));
@@ -51,6 +51,7 @@
     if (/^\/t\/[^/]+\/notifications(?:\.json)?$/.test(path)) return sourceLabels.notification;
     if (/^\/bookmarks(?:\/[^/]+)?\.json$/.test(path)) return sourceLabels.bookmark;
     if (path === "/session/csrf.json") return sourceLabels.csrf;
+    if (path === "/polls/vote") return sourceLabels.poll;
     if (path === "/session/current.json") return sourceLabels.account;
     if (["/site.json", "/tags.json"].includes(path)) return sourceLabels.metadata;
     if (path === "/search.json") return sourceLabels.search;
@@ -469,7 +470,7 @@
 
   const previewExcluded = ".emoji, .emoji-custom, .avatar, .avatar-wrapper, .onebox, .onebox-body, .onebox-header, .onebox-avatar, .onebox-icon, .site-icon, .favicon, .logo";
 
-  function cooked(html) {
+  function cooked(html, { renderPoll } = {}) {
     const template = document.createElement("template");
     template.innerHTML = html || "";
     const result = document.createDocumentFragment();
@@ -479,6 +480,10 @@
         return;
       }
       if (source.nodeType !== Node.ELEMENT_NODE || discard.has(source.tagName) || source.namespaceURI !== "http://www.w3.org/1999/xhtml") return;
+      if (renderPoll && source.matches("div.poll[data-poll-name]")) {
+        const widget = renderPoll(source.getAttribute("data-poll-name"));
+        if (widget) { parent.append(widget); return; }
+      }
       if (!allowed.has(source.tagName)) {
         source.childNodes.forEach(child => copy(child, parent));
         return;

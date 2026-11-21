@@ -75,7 +75,7 @@ const post = (floor, extra = {}) => ({ id: 100 + floor, topic_id: 123, post_numb
   user_id: 10 + floor, cooked: `<p>body${floor}</p>`, created_at: "2026-11-18T01:00:00Z", ...extra });
 const boost = (id, userId = 9, extra = {}) => ({ id, cooked: "<p>前排</p>", user: { id: userId, username: `u${userId}` }, ...extra });
 const enabled = "heart|+1|laughing|open_mouth|clap|confetti_ball|hugs|distorted_face|tieba_087|bili_057";
-function fixture({ posts = [post(1), post(2)], user = { id: 7 }, settings = {}, data = {}, change, confirm = true } = {}) {
+function fixture({ posts = [post(1), post(2)], user = { id: 7 }, settings = {}, data = {}, change, confirm = true, savedSort } = {}) {
   const root = new Node("root"); root._connected = true;
   const shell = new Node("div", "shell"), toolbar = new Node(), actions = new Node(), reading = new Node(), status = new Node(), scroll = new Node();
   actions.id = "reading-actions"; reading.id = "reading"; status.id = "live-status"; status.hidden = true; scroll.id = "read-scroll";
@@ -105,9 +105,10 @@ function fixture({ posts = [post(1), post(2)], user = { id: 7 }, settings = {}, 
     getElementById: id => id === "data-preloaded" ? preloaded : null };
   const window = { location, addEventListener() {}, removeEventListener() {}, confirm(message) { calls.confirms.push(message); return confirm; } };
   const context = vm.createContext({ URL, URLSearchParams, Intl, AbortController, DOMException, setTimeout, clearTimeout, Event, Node, Element: Node,
-    document, window, location, innerWidth: 1440, innerHeight: 900, performance: { now: () => 0 }, LDForum: forum,
+    document, window, location, localStorage: { getItem: key => key === "ldr-native-tree:sort" ? savedSort ?? null : null },
+    innerWidth: 1440, innerHeight: 900, performance: { now: () => 0 }, LDForum: forum,
     __root: root, __detail: detail, __user: user, __calls: calls });
-  for (const name of ["navigation.js", "discussions.js", "scrolling.js"]) vm.runInContext(source(name), context);
+  for (const name of ["navigation.js", "discussions.js", "scrolling.js", "polls.js"]) vm.runInContext(source(name), context);
   const script = source("reader.js").replace("  const requestedAtStart = requestedURL();", `
     root = __root; host = __root; topicRequest = __detail.controller;
     state.onScreen = true; state.selected = __detail.data; state.detail = __detail; state.user = __user;
@@ -116,7 +117,7 @@ function fixture({ posts = [post(1), post(2)], user = { id: 7 }, settings = {}, 
     notify = message => __calls.notifications.push(message);
     globalThis.readerTest = { state, renderReading, clicked, keydown, openMenu, closeMenu, populateMenu, canBoost,
       reactionAllowed, toggleReaction, submitBoost, deleteBoost, boostRaw, boostStats, insertBoostEmoji,
-      updateBoostComposer, interactionPointer, clearInteractionTimers };
+      updateBoostComposer, interactionPointer, clearInteractionTimers, initialReplySort, changeReplySort, topicReplyCount };
     const requestedAtStart = false;
   `);
   vm.runInContext(script, context);
@@ -368,4 +369,61 @@ test("disabled emoji selection does not advertise or open a keyboard picker", ()
   assert.equal(toggle.getAttribute("aria-keyshortcuts"), null);
   assert.equal(f.key(toggle, "ArrowDown").defaultPrevented, undefined);
   assert.equal(f.api.state.openMenu, null); assert.equal(f.calls.changes.length, 0);
+});
+
+
+test("initial reply order follows explicit sort, native preference and site default without writes", () => {
+  const native = fixture({ savedSort: "new", settings: { nested_replies_default_sort: "old" } });
+  assert.equal(native.api.initialReplySort(), "newest");
+  assert.equal(native.api.initialReplySort("/t/topic/123?sort=old"), "oldest");
+  assert.equal(native.api.initialReplySort("/t/topic/123?sort=top"), "top");
+  assert.equal(native.api.initialReplySort("/t/topic/123?sort=__proto__"), "newest");
+  assert.equal(fixture({ settings: { nested_replies_default_sort: "top" } }).api.initialReplySort(), "top");
+  assert.equal(fixture({ savedSort: "constructor" }).api.initialReplySort(), "oldest");
+  assert.equal(native.calls.requests.length, 0); assert.equal(native.calls.changes.length, 0);
+});
+
+test("explicit reader order is retained for later topics in this homepage session", () => {
+  const f = fixture({ savedSort: "old" }); f.render();
+  f.api.changeReplySort("top");
+  assert.equal(f.api.initialReplySort(), "top");
+  assert.equal(f.api.initialReplySort("/t/topic/123?sort=new"), "newest");
+});
+
+test("topic counts remain visible with labels, zero views and a missing original post", () => {
+  const f = fixture({ posts: [post(2)], data: { posts_count: 3, reply_count: 0, views: 0 } }); f.render();
+  assert.equal(f.root.querySelector("#topic-view-count").textContent, "0浏览量");
+  assert.equal(f.root.querySelector("#topic-reply-count").textContent, "2回复");
+  assert.equal(f.root.querySelectorAll("#topic-metrics").length, 1);
+  assert.equal(f.api.topicReplyCount({ posts_count: undefined, reply_count: 7 }), 7);
+  assert.equal(f.api.topicReplyCount({ posts_count: NaN }, { posts_count: 5 }), 4);
+  assert.equal(f.api.topicReplyCount({}), null);
+  const unknown = fixture({ data: { posts_count: undefined, reply_count: undefined } }); unknown.render();
+  assert.equal(unknown.root.querySelector("#topic-reply-count"), null);
+  assert.equal(unknown.root.querySelector(".reply-count").textContent, "—");
+  assert.match(unknown.root.querySelector(".reply-footer").textContent, /总数暂不可用/);
+});
+
+const samplePoll = (name = "poll1", extra = {}) => ({ name, title: "统计", type: "regular", status: "open", results: "always", voters: 65,
+  options: [{ id: "a", html: "已掉", votes: 10 }, { id: "b", html: "未掉", votes: 55 }], ...extra });
+
+test("actual reader renders polls on available first and reply floors and routes explicit vote clicks", async () => {
+  const f = fixture({ posts: [post(1, { polls: [samplePoll()] }), post(2, { polls: [samplePoll("reply")] }),
+    post(3, { hidden: true, polls: [samplePoll("hidden")] }), post(4, { user_deleted: true, polls: [samplePoll("deleted")] })],
+    change: (path, method, body) => ({ poll: samplePoll(body.poll_name, { voters: 66 }) }) }); f.render();
+  assert.equal(f.root.querySelectorAll(".ld-poll").length, 2);
+  const widget = f.card(1).querySelector(".ld-poll");
+  assert.equal(widget.querySelector(".poll-voters").textContent, "65 人参与");
+  f.click(widget.querySelector('[data-action="poll-option"]')); await delay(0);
+  assert.deepEqual(f.calls.changes, [{ path: "/polls/vote", method: "PUT", body: { post_id: 101, poll_name: "poll1", options: ["a"] } }]);
+  assert.equal(f.detail.posts.get(101).polls[0].voters, 66);
+  assert.equal(f.root.querySelectorAll(".ld-poll").length, 2);
+});
+
+test("reader results toggles are read-only and hidden polls cannot leak result rows", () => {
+  const f = fixture({ posts: [post(1, { polls: [samplePoll()] }), post(2, { polls: [samplePoll("hidden-results", { results: "staff_only" })] })] }); f.render();
+  f.click(f.card(1).querySelector('[data-action="poll-results"]'));
+  assert.equal(f.card(1).querySelectorAll(".poll-result").length, 2);
+  assert.equal(f.card(2).querySelectorAll(".poll-result").length, 0);
+  assert.equal(f.calls.changes.length, 0); assert.equal(f.calls.requests.length, 0);
 });

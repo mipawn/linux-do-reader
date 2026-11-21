@@ -79,11 +79,11 @@ test("oldest and newest reorder sibling groups recursively without flattening", 
   assert.deepEqual(floors(newest[1].children[1].children), [9, 7]);
 });
 
-test("valid dates determine oldest/newest and equal dates always tie by ascending floor", () => {
+test("oldest follows native floor order while newest follows dates with stable floor ties", () => {
   const a = { ...post(2), created_at: "2026-11-17T02:00:00Z" };
   const b = { ...post(3), created_at: "2026-11-17T01:00:00Z" };
   const c = { ...post(4), created_at: b.created_at };
-  assert.deepEqual(floors(replyTree([c, b, a], "oldest")), [3, 4, 2]);
+  assert.deepEqual(floors(replyTree([c, b, a], "oldest")), [2, 3, 4]);
   assert.deepEqual(floors(replyTree([c, b, a], "newest")), [2, 3, 4]);
 });
 
@@ -211,6 +211,7 @@ function renderFixture() {
   }
   const calls = [];
   const context = vm.createContext({
+    polls: null,
     LDDiscussion: globalThisDiscussions(),
     element: (tag, className, text) => new FakeNode(tag, className, text),
     add: (node, ...children) => { node.append(...children.filter(child => child != null)); return node; },

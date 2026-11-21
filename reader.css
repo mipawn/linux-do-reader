@@ -239,10 +239,17 @@ time, .metrics, .reply-count, .floor { font-variant-numeric: tabular-nums; }
 .category-dot { background: var(--dot, var(--accent-line)); width: 7px; height: 7px; flex: 0 0 7px; border-radius: 50%; }
 .tag { white-space: nowrap; border-radius: 4px; background: var(--chip); padding: 0 5px; }
 button.category:hover, button.tag:hover { color: var(--accent-text); text-decoration: underline; text-underline-offset: 3px; }
-.row-meta { margin-left: 12px; display: flex; align-items: center; justify-content: space-between; gap: 5px; color: var(--dim); font-size: 13px; min-width: 0; }
+.row-meta { margin-left: 12px; display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 5px; color: var(--dim); font-size: 13px; min-width: 0; }
 .person, .metrics, .stat, .post-author { display: inline-flex; align-items: center; gap: 5px; min-width: 0; }
 .person > span:nth-child(2) { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .metrics { flex-shrink: 0; gap: 8px; }
+.metrics .stat { gap: 3px; white-space: nowrap; }
+.stat-label { color: var(--muted); font-size: 11px; }
+.topic-metrics { display: flex; flex-wrap: wrap; align-items: center; gap: 14px 24px; padding: 12px 0; color: var(--dim); font-size: 15px; }
+.topic-metrics .stat { white-space: nowrap; gap: 6px; }
+.topic-metrics .stat-number { color: var(--ink); font-weight: 650; font-variant-numeric: tabular-nums; }
+.topic-metrics .stat-label { font-size: 13px; }
+.topic-metrics .ic { --icon-size: 15px; }
 .metrics .ic { --icon-size: 14px; margin-right: -2px; }
 .avatar { flex: 0 0 var(--avatar); display: inline-grid; place-items: center; width: var(--avatar); height: var(--avatar); border-radius: 50%; overflow: hidden; position: relative; background: hsl(var(--hue) 35% 84%); color: hsl(var(--hue) 30% 28%); font-size: calc(var(--avatar) * .48); font-weight: 760; line-height: 1; }
 .avatar img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }

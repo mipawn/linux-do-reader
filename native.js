@@ -236,7 +236,11 @@
     const categories = get(site, "categories") || [];
     const tags = get(site, "top_tags") || get(site, "tags") || [];
     return {
-      user: currentUser && positive(get(currentUser, "id")) ? publicUser(currentUser) : null,
+      user: currentUser && positive(get(currentUser, "id")) ? {
+        ...publicUser(currentUser),
+        visibleGroups: Array.isArray(get(currentUser, "visibleGroups") || get(currentUser, "groups"))
+          ? (get(currentUser, "visibleGroups") || get(currentUser, "groups")).slice(0, 1000).map(group => pick(group, ["id", "name"])) : []
+      } : null,
       categories: Array.isArray(categories) ? categories.slice(0, 1000).map(category => pick(category, ["id", "name", "slug", "color", "text_color", "parent_category_id", "position", "description_text"])) : [],
       tags: Array.isArray(tags) ? tags.slice(0, 1000).map(tag => typeof tag === "string" ? { name: tag.slice(0, 256) } : pick(tag, ["id", "name", "slug", "count", "topic_count"])) : [],
       presenceEnabled: typeof settings.presence_enabled === "boolean" ? settings.presence_enabled : null

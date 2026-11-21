@@ -21,7 +21,8 @@
   const outletClass = "ld-reader-active";
   let host, root, listRequest, topicRequest, outlet, modeSwitch, nativeHeader, headerObserver, listPager, replyPager;
   let pendingOpen = false, readerMode = true, originalLocation, originalPosition, contextLoaded = false;
-  let nativeClient, contextRequest, imagePreview;
+  let nativeClient, contextRequest, imagePreview, polls;
+  let replySortOverride; // Explicit reader selection lasts for this homepage session.
   let recoveryTimer;
   let headerLogo;
   const $ = (selector) => root.querySelector(selector);
@@ -119,12 +120,47 @@
     return node;
   }
 
-  function stat(symbol, label, count) {
-    if (count == null) return null;
-    const node = add(element("span", "stat"), icon(symbol), element("span", "", number.format(count)));
+  function stat(symbol, label, count, showLabel = false) {
+    if (count == null || !Number.isFinite(Number(count)) || Number(count) < 0) return null;
+    const node = add(element("span", "stat"), icon(symbol), element("span", "stat-number", number.format(count)));
+    if (showLabel) node.append(element("span", "stat-label", label));
     node.title = label + " " + count;
     node.setAttribute("aria-label", node.title);
     return node;
+  }
+
+  function topicReplyCount(topic, fallback) {
+    for (const source of [topic, fallback]) {
+      if (Number.isFinite(source?.posts_count) && source.posts_count >= 1) return source.posts_count - 1;
+      if (Number.isFinite(source?.reply_count) && source.reply_count >= 0) return source.reply_count;
+    }
+    return null;
+  }
+
+  function topicMetrics(detail) {
+    const summary = element("div", "topic-metrics");
+    summary.id = "topic-metrics";
+    summary.setAttribute("aria-label", "话题统计");
+    const replies = stat("comment", "回复", topicReplyCount(detail.data, state.selected), true);
+    if (replies) replies.id = "topic-reply-count";
+    const views = stat("eye", "浏览量", detail.data.views ?? state.selected?.views, true);
+    if (views) views.id = "topic-view-count";
+    add(summary, views, replies, stat("heart", "点赞", detail.data.like_count, true));
+    return summary;
+  }
+
+  function initialReplySort(path) {
+    const aliases = new Map([["old", "oldest"], ["new", "newest"], ["top", "top"], ["oldest", "oldest"], ["newest", "newest"]]);
+    const explicit = path && forum.safeURL(path)?.searchParams.get("sort");
+    if (aliases.has(explicit)) return aliases.get(explicit);
+    if (replySortOverride) return replySortOverride;
+    // The native-tree integration remembers the effective order separately from
+    // Discourse's site default. Read it without changing the original preference.
+    try {
+      const saved = localStorage.getItem("ldr-native-tree:sort");
+      if (aliases.has(saved)) return aliases.get(saved);
+    } catch {}
+    return aliases.get(readerSettings().nested_replies_default_sort) || "oldest";
   }
 
   function parsePayload(value) {
@@ -804,6 +840,10 @@
     previewStyle.rel = "stylesheet";
     previewStyle.href = asset("image-preview.css");
     root.append(previewStyle);
+    const pollStyle = element("link");
+    pollStyle.rel = "stylesheet";
+    pollStyle.href = asset("polls.css");
+    root.append(pollStyle);
     const shell = element("div", "shell");
     shell.innerHTML = `
       <header class="header">
@@ -937,8 +977,8 @@
     const created = topic.hit?.created_at || topic.last_posted_at || topic.created_at;
     const clock = date(created, true);
     clock.title = (topic.hit ? "搜索命中时间 " : "最后活动 ") + forum.dateLabel(created);
-    const metrics = add(element("span", "metrics"), stat("comment", "回复", topic.posts_count == null ? topic.reply_count : Math.max(0, topic.posts_count - 1)),
-      stat("eye", "浏览", topic.views), clock);
+    const metrics = add(element("span", "metrics"), stat("comment", "回复", topicReplyCount(topic), true),
+      stat("eye", "浏览量", topic.views, true), clock);
     summary.append(title, chips, add(element("span", "row-meta"), person, metrics));
     row.append(summary);
     return row;
@@ -1067,6 +1107,8 @@
   function clearTopic() {
     clearInteractionTimers();
     imagePreview?.close({ restoreFocus: false });
+    polls?.destroy();
+    polls = null;
     state.detail?.live?.stop();
     topicRequest?.abort();
     state.selected = null;
@@ -1093,6 +1135,8 @@
     if (state.selected?.id === topic.id && (state.detail || state.topicBusy)) return;
     clearInteractionTimers();
     imagePreview?.close({ restoreFocus: false });
+    polls?.destroy();
+    polls = null;
     state.detail?.live?.stop();
     topicRequest?.abort();
     const controller = new AbortController();
@@ -1113,8 +1157,9 @@
       if (!data.post_stream?.posts?.length) throw new Error("原站未返回可阅读的楼层。");
       const posts = new Map(data.post_stream.posts.map(post => [post.id, post]));
       const stream = data.post_stream.stream || [...posts.keys()];
+      const sort = initialReplySort(topic.readerPath);
       state.detail = { data, stream, posts, attempted: new Set(posts.keys()), collapsed: new Set(), expandedLinks: new Set(), controller,
-        pendingFloor: initialFloor || null, moreBusy: false, sort: "oldest", retryAt: 0 };
+        pendingFloor: initialFloor || null, moreBusy: false, sort, sortLoadPending: sort === "newest", retryAt: 0 };
       resetReplyPager(state.detail);
       rememberTags(data.tags);
       renderReading();
@@ -1160,8 +1205,7 @@
           if (state.detail !== detail || !state.onScreen) return;
           if (opChanged) refreshReadingView();
           else {
-            const count = stat("comment", "回复", Math.max(0, detail.data.posts_count - 1));
-            if (count) { count.id = "topic-reply-count"; $("#topic-reply-count")?.replaceWith(count); }
+            $("#topic-metrics")?.replaceWith(topicMetrics(detail));
             renderReplies();
           }
         }
@@ -1303,6 +1347,20 @@
       showLevel && Number.isInteger(post.trust_level) ? element("small", "level", "L" + post.trust_level) : null);
   }
 
+  function getPolls() {
+    if (!polls && globalThis.LDPolls) polls = globalThis.LDPolls.create({
+      forum, document,
+      getContext: () => ({ detail: state.detail, user: state.user, onScreen: state.onScreen }),
+      onChange: () => { if (state.detail && state.onScreen) refreshReadingView(); },
+      onError: error => {
+        if (forum.requestQueue.cooldown()) state.detail?.live?.pause(error);
+        notify(error.message);
+        scheduleRecovery();
+      }
+    });
+    return polls;
+  }
+
   function postContent(post) {
     const node = element("div", "post-content");
     const postState = globalThis.LDDiscussion.postState(post);
@@ -1314,8 +1372,24 @@
       node.textContent = post?.placeholder === "missing-parent"
         ? "此父楼层未加载或不可用，无法判断是否已删除；已加载的子回复仍显示在下方。"
         : "此楼层内容暂不可用。";
-    } else if (post?.cooked) node.append(forum.cooked(post.cooked));
-    else node.textContent = "此楼层暂无可显示的内容。";
+    } else if (post?.cooked) {
+      const widgets = getPolls()?.render(post) || [];
+      const remaining = new Map(widgets.map(widget => [widget.dataset.pollName, widget]));
+      node.append(forum.cooked(post.cooked, { renderPoll: name => {
+        const widget = remaining.get(name);
+        if (widget) remaining.delete(name);
+        if (widget || !globalThis.LDPolls) return widget;
+        return add(element("section", "ld-poll"), element("p", "poll-notice", "原站未返回此投票的数据，请到原站查看和参与。"),
+          anchor("打开原站投票", forum.topicPath(state.detail.data, post.post_number), "poll-original-link"));
+      } }));
+      // Metadata may precede a recooked body; don't lose a serialized poll solely
+      // because its static placeholder is absent from cooked HTML.
+      node.append(...remaining.values());
+    } else {
+      const widgets = getPolls()?.render(post) || [];
+      if (widgets.length) node.append(...widgets);
+      else node.textContent = "此楼层暂无可显示的内容。";
+    }
     return node;
   }
 
@@ -1359,10 +1433,7 @@
     if (breadcrumb.childNodes.length) header.append(breadcrumb);
     header.append(element("h2", "article-title", data.title || selected.title));
     if (op) {
-      const replyCount = stat("comment", "回复", Math.max(0, data.posts_count - 1));
-      if (replyCount) replyCount.id = "topic-reply-count";
-      header.append(add(element("div", "article-meta"), replyPerson(op, true), date(op.created_at),
-        replyCount, stat("eye", "浏览", data.views), stat("heart", "点赞", data.like_count)));
+      header.append(add(element("div", "article-meta"), replyPerson(op, true), date(op.created_at)));
     } else header.append(date(data.created_at));
     const tags = (data.tags || []).slice(0, 12);
     if (tags.length) header.append(add(element("div", "chips article-tags"), ...tags.map(tag => tagPill(tag))));
@@ -1371,7 +1442,7 @@
       mainPost.dataset.postNumber = op.post_number;
       mainPost.append(...postExtras(op), postControls(detail, op));
     }
-    content.append(header, mainPost);
+    content.append(header, topicMetrics(detail), mainPost);
     if (detail.pendingFloor && ![...detail.posts.values()].some(post => post.post_number === detail.pendingFloor)) {
       content.append(anchor(`在原站查看 #${detail.pendingFloor}`, forum.topicPath(data, detail.pendingFloor), "secondary-button", "out"));
     }
@@ -1387,6 +1458,7 @@
     const detail = state.detail;
     if (!detail || !["oldest", "newest", "top"].includes(value) || detail.sort === value) return;
     detail.sort = value;
+    replySortOverride = value;
     detail.sortGeneration = (detail.sortGeneration || 0) + 1;
     detail.sortLoadPending = value === "newest" && pendingPostIds(detail).length > 0;
     if (value === "newest" && detail.retryAt <= Date.now()) detail.moreError = null;
@@ -1426,10 +1498,10 @@
     const anchorTop = visible?.getBoundingClientRect().top;
     const restoreSortFocus = root.activeElement?.id === "reply-sort";
     const byNumber = new Map([...posts.values()].map(post => [post.post_number, post]));
-    const total = Math.max(0, (Number(data.posts_count) || 0) - 1);
+    const total = topicReplyCount(data, state.selected);
     const loaded = [...posts.values()].filter(post => post.post_number > 1).length;
     const heading = add(element("div", "replies-heading"),
-      add(element("div", "reply-title"), icon("tree"), element("h3", "", "树状讨论"), element("span", "reply-count", total)));
+      add(element("div", "reply-title"), icon("tree"), element("h3", "", "树状讨论"), element("span", "reply-count", total ?? "—")));
     const tools = element("div", "reply-tools");
     const sortLabel = element("label", "reply-sort-label", "排序");
     sortLabel.htmlFor = "reply-sort";
@@ -1450,7 +1522,8 @@
       : "从最早的未加载回复继续读取；各分支的同级回复分别排序。");
     sortNote.id = "reply-sort-note";
     section.replaceChildren(heading, sortNote);
-    if (!loaded && !total) section.append(status("还没有回复。"));
+    if (!loaded && total === 0) section.append(status("还没有回复。"));
+    else if (!loaded && total == null) section.append(status("回复总数暂不可用。"));
     const tree = element("ol", "tree");
     tree.setAttribute("aria-label", "按回复关系排列的楼层");
     const queue = [];
@@ -1507,7 +1580,9 @@
     const pending = pendingPostIds(detail).length > 0;
     const paused = detail.paging?.status === "paused";
     const retrySeconds = Math.max(0, Math.ceil(((detail.retryAt || 0) - Date.now()) / 1000));
-    const footer = add(element("div", "reply-footer"), element("span", "", `已载入 ${loaded} / ${Math.max(total, loaded)} 条回复`));
+    const footer = add(element("div", "reply-footer"), element("span", "", total == null
+      ? `已载入 ${loaded} 条回复，总数暂不可用`
+      : `已载入 ${loaded} / ${Math.max(total, loaded)} 条回复`));
     if (paused) footer.append(element("span", "paging-paused", "自动加载已暂停：未取得高度进展或遇到重复游标，可手动继续。"));
     else if (pending && !detail.moreError && !retrySeconds) footer.append(element("span", "", "继续滚动或手动加载，每次至多一页"));
     if (pending || detail.moreError || paused || detail.moreBusy || retrySeconds) {
@@ -1945,6 +2020,13 @@
     if (action !== "sidebar") closeSidebar();
     if (!control) return;
     switch (action) {
+      case "poll-option":
+      case "poll-submit":
+      case "poll-results":
+      case "poll-remove":
+        event.preventDefault();
+        void getPolls()?.handle(action, control);
+        break;
       case "mode": closeMenu(true); switchFeed(value); break;
       case "category": switchFeed("latest", state.categories.get(Number(value)) || null, state.tag); break;
       case "tag": switchFeed("latest", state.category, control._readerTag || null); break;
@@ -1969,7 +2051,7 @@
         if (event.ctrlKey || event.metaKey || event.shiftKey || event.altKey || event.button > 0) return;
         event.preventDefault();
         const row = state.rows.find(topic => topic.id === Number(value));
-        if (row) selectTopic(row, true, row.hit?.post_number);
+        if (row) selectTopic({ ...row, readerPath: control.href }, true, row.hit?.post_number);
         if (host.clientWidth <= 760) $(".mobile-back").focus({ preventScroll: true });
         break;
       }

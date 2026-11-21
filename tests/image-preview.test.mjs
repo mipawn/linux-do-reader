@@ -205,6 +205,23 @@ function wheel(f, deltaY, x = 500, y = 380, extra = {}) {
 }
 function near(actual, expected, label) { assert.ok(Math.abs(actual - expected) < .00001, `${label || 'value'} ${actual} ~= ${expected}`); }
 
+test("serialized poll widgets replace stale cooked placeholders in place without copying active HTML", () => {
+  const f = fixture();
+  const widget = f.document.createElement("section"); widget.textContent = "68 人参与";
+  const names = [];
+  const cooked = f.context.LDForum.cooked('<p>之前</p><div class="poll" data-poll-name="poll1" onclick="bad()"><script>bad()</script><span>0 voters</span></div><p>之后</p>', {
+    renderPoll(name) { names.push(name); return widget; }
+  });
+  assert.deepEqual(names, ["poll1"]);
+  assert.equal(cooked.textContent, "之前68 人参与之后");
+  assert.equal(cooked.querySelector("section"), widget);
+  assert.equal(cooked.querySelectorAll("script").length, 0);
+  assert.equal(widget.hasAttribute("onclick"), false);
+  const noPoll = f.context.LDForum.cooked('<div data-poll-name="forged" data-action="poll-option">普通内容</div>', { renderPoll() { throw new Error("not a poll"); } });
+  assert.equal(noPoll.textContent, "普通内容");
+  assert.equal(noPoll.children[0].hasAttribute("data-action"), false);
+});
+
 test("safe URLs allow HTTPS relatives but reject executable, insecure, credentialed and malformed schemes", () => {
   const f = fixture();
   for (const value of ["javascript:alert(1)", "data:image/svg+xml,bad", "blob:https://linux.do/id", "http://linux.do/x.png", "https://user:secret@example/x.png", "https://user@example/x.png", "https://[", "", null, 4]) {

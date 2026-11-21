@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "LINUX DO 阅读器",
-  "version": "1.7.8",
+  "version": "1.7.9",
   "description": "仅增强 Linux.do 首页：原地阅读树状讨论，使用原版编辑器回复，显示正在回复并按消息增量更新。",
   "icons": { "32": "icon.png", "128": "icon.png" },
   "action": { "default_title": "打开 LINUX DO 阅读器", "default_icon": "icon.png" },
@@ -9,7 +9,7 @@
   "content_scripts": [{
     "matches": ["https://linux.do/*"],
     "css": ["launcher.css"],
-    "js": ["forum.js", "navigation.js", "discussions.js", "scrolling.js", "live.js", "image-preview.js", "reader.js"],
+    "js": ["forum.js", "navigation.js", "discussions.js", "scrolling.js", "live.js", "image-preview.js", "polls.js", "reader.js"],
     "run_at": "document_start"
   }, {
     "matches": ["https://linux.do/*"],
@@ -18,7 +18,7 @@
     "run_at": "document_start"
   }],
   "web_accessible_resources": [{
-    "resources": ["reader.css", "image-preview.css", "symbols.png"],
+    "resources": ["reader.css", "image-preview.css", "polls.css", "symbols.png"],
     "matches": ["https://linux.do/*"]
   }]
 }

@@ -27,6 +27,8 @@ assets = (
     "reader.css",
     "image-preview.js",
     "image-preview.css",
+    "polls.js",
+    "polls.css",
     "launcher.css",
     "icon.png",
     "symbols.png",

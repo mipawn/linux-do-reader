@@ -134,7 +134,7 @@ test("extension action opens a new homepage when the tab has no ID", async () =>
 test("manifest and archive contain the strictly scoped native reply/live bridge, not a reading tracker", () => {
   const manifest = JSON.parse(source("manifest.json"));
   assert.equal(manifest.content_scripts.length, 2);
-  assert.deepEqual(manifest.content_scripts[0].js, ["forum.js", "navigation.js", "discussions.js", "scrolling.js", "live.js", "image-preview.js", "reader.js"]);
+  assert.deepEqual(manifest.content_scripts[0].js, ["forum.js", "navigation.js", "discussions.js", "scrolling.js", "live.js", "image-preview.js", "polls.js", "reader.js"]);
   assert.equal(manifest.content_scripts[0].world, undefined);
   assert.deepEqual(manifest.content_scripts[1].js, ["native.js"]);
   assert.equal(manifest.content_scripts[1].world, "MAIN");
@@ -162,7 +162,7 @@ test("normal topic titles open the tree directly while keeping native modifier c
   assert.match(reader, /summary\.removeAttribute\("target"\)/);
   assert.match(reader, /summary\.dataset\.action = "topic"/);
   assert.match(reader, /event\.preventDefault\(\)/);
-  assert.match(reader, /if \(row\) selectTopic\(row, true, row\.hit\?\.post_number\)/);
+  assert.match(reader, /if \(row\) selectTopic\(\{ \.\.\.row, readerPath: control\.href \}, true, row\.hit\?\.post_number\)/);
   assert.match(reader, /event\.ctrlKey \|\| event\.metaKey/);
   assert.doesNotMatch(reader, /topic-tree-button/);
   assert.match(reader, /const marker = topic\.unseen \? element\("span", "unseen-dot"\) : null/);
