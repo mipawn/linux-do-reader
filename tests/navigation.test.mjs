@@ -178,7 +178,7 @@ function readerFixture(feed) {
     document: { readyState: "loading", addEventListener() {} }, LDForum: forum, LDNavigation: navigationFixture() });
   const script = source("reader.js").replace("  const requestedAtStart = requestedURL();", `
     root = { querySelector: () => ({ scrollTop: 0 }) };
-    renderList = renderFilters = () => {};
+    renderList = renderListFooter = renderFilters = () => {};
     clearTopic = () => { state.selected = null; state.detail = null; };
     globalThis.testReader = { state, loadList };
     const requestedAtStart = false;

@@ -244,6 +244,18 @@ test("cooked wraps ordinary images in original anchors, recreates metadata and s
   assert.equal(image.referrerPolicy, "no-referrer");
 });
 
+test("cooked preserves valid intrinsic dimensions on ordinary images while omitting invalid or emoji dimensions", () => {
+  const f = fixture('<p><img src="/photo.png" width="800" height="600"><img src="/bad.png" width="0" height="20000"><img class="emoji" src="/emoji.png" width="20" height="20"></p>');
+  const imgs = f.content.querySelectorAll("img");
+  assert.equal(imgs.length, 3);
+  assert.equal(imgs[0].getAttribute("width"), "800");
+  assert.equal(imgs[0].getAttribute("height"), "600");
+  assert.equal(imgs[1].hasAttribute("width"), false);
+  assert.equal(imgs[1].hasAttribute("height"), false);
+  assert.equal(imgs[2].hasAttribute("width"), false);
+  assert.equal(imgs[2].hasAttribute("height"), false);
+});
+
 test("ordinary click opens an accessible modal without changing the original link", () => {
   const f = fixture(), image = f.images()[0], event = click(image);
   assert.equal(f.controller.handleClick(event), true);

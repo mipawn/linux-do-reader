@@ -138,7 +138,7 @@ function fixture({ posts = [post(1), post(2)], user = { id: 7 }, data: changes =
     state.rows = [__detail.data]; state.nativeContext = { presenceEnabled: false };
     updateSteps = renderList = renderFilters = closeMenu = closeSidebar = sizeReader = resetReplyPager = scheduleRecovery = () => {};
     notify = message => __calls.notifications.push(message);
-    globalThis.readerTest = { state, renderReading, renderReplies, replyTo, clicked, startTopicLive,
+    globalThis.readerTest = { state, renderReading, renderReplies, renderReplyFooter, replyTo, clicked, startTopicLive,
       pendingPostIds, loadReplies, changeReplySort, maybeLoadSortedPage, loadContext, clearTopic, selectTopic, canReply, populateMenu,
       openMenu, toggleReaction, submitBoost, deleteBoost, postByFloor, boostStats };
     const requestedAtStart = false;
@@ -940,4 +940,67 @@ test("latest pagination skips unavailable and live-owned ids without reversing t
   f.detail.stream.push(103, 104, 105, 106); f.detail.attempted.add(104); f.detail.sort = "newest"; f.live();
   assert.deepEqual(plain(f.api.pendingPostIds(f.detail)), [106, 103]);
   assert.deepEqual(f.detail.stream, [101, 102, 103, 104, 105, 106]);
+});
+
+test("changing sort on one topic does not carry over when opening another topic", async () => {
+  const f = fixture({ posts: [post(1), post(2)] });
+  f.render();
+  f.api.changeReplySort("newest");
+  assert.equal(f.detail.sort, "newest");
+  await f.api.selectTopic({ id: 456, title: "Next Topic" });
+  assert.equal(f.api.state.detail.sort, "oldest");
+  assert.equal(f.api.state.detail.sortLoadPending, false);
+  assert.equal(f.root.querySelector("#reply-sort").value, "oldest");
+});
+
+test("failed reply pagination and cooldown countdown ticks update only .reply-footer without rebuilding reply cards or jumping scroll", async () => {
+  let rejectPage;
+  const f = fixture({
+    posts: [post(1), post(2), post(3)],
+    page: () => new Promise((_, reject) => { rejectPage = reject; })
+  });
+  f.detail.stream.push(104, 105);
+  movingReplyGeometry(f);
+  f.render();
+  f.scroll.scrollTop = 240;
+
+  const cardsBefore = f.root.querySelectorAll(".reply-card");
+  const bodiesBefore = cardsBefore.map(card => card.querySelector(".post-content"));
+  const footerBefore = f.root.querySelector("#reply-section .reply-footer");
+  assert.equal(cardsBefore.length, 2);
+
+  const loading = f.api.loadReplies({ background: true });
+  assert.equal(f.detail.moreBusy, true);
+  assert.deepEqual(f.root.querySelectorAll(".reply-card"), cardsBefore, "loading start must not rebuild reply cards");
+  assert.equal(f.root.querySelector("#reply-section .reply-footer"), footerBefore, "footer sentinel node must stay intact");
+  assert.match(footerBefore.textContent, /正在加载/);
+  assert.equal(f.scroll.scrollTop, 240);
+
+  rejectPage(Object.assign(new Error("原站返回限流"), { retryAt: Date.now() + 3000 }));
+  await assert.rejects(loading, /限流/);
+
+  assert.deepEqual(f.root.querySelectorAll(".reply-card"), cardsBefore, "error state must not rebuild reply cards");
+  for (let i = 0; i < cardsBefore.length; i++) {
+    assert.equal(cardsBefore[i].querySelector(".post-content"), bodiesBefore[i]);
+  }
+  assert.equal(f.root.querySelector("#reply-section .reply-footer"), footerBefore);
+  assert.equal(f.scroll.scrollTop, 240);
+  const moreButton = () => footerBefore.querySelector('[data-action="more-posts"]');
+  assert.equal(moreButton().disabled, true);
+  assert.match(footerBefore.textContent, /秒后可重试/);
+
+  // Simulate repeated 1-second scheduleRecovery() ticks while cooling down, then after expiry.
+  for (let i = 0; i < 3; i++) {
+    f.api.renderReplyFooter();
+    assert.deepEqual(f.root.querySelectorAll(".reply-card"), cardsBefore);
+    assert.equal(f.root.querySelector("#reply-section .reply-footer"), footerBefore);
+    assert.equal(f.scroll.scrollTop, 240);
+  }
+  f.detail.retryAt = Date.now() - 100;
+  f.api.renderReplyFooter();
+  assert.equal(moreButton().disabled, false);
+  assert.equal(moreButton().textContent, "重试");
+  assert.deepEqual(f.root.querySelectorAll(".reply-card"), cardsBefore);
+  assert.equal(f.scroll.scrollTop, 240);
+  assert.match(source("reader.js"), /if \(state\.detail\?\.moreError\) renderReplyFooter\(\);/);
 });

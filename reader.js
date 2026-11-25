@@ -22,7 +22,6 @@
   let host, root, listRequest, topicRequest, outlet, modeSwitch, nativeHeader, headerObserver, listPager, replyPager;
   let pendingOpen = false, readerMode = true, originalLocation, originalPosition, contextLoaded = false;
   let nativeClient, contextRequest, imagePreview, polls;
-  let replySortOverride; // Explicit reader selection lasts for this homepage session.
   let recoveryTimer;
   let headerLogo;
   const $ = (selector) => root.querySelector(selector);
@@ -152,15 +151,7 @@
   function initialReplySort(path) {
     const aliases = new Map([["old", "oldest"], ["new", "newest"], ["top", "top"], ["oldest", "oldest"], ["newest", "newest"]]);
     const explicit = path && forum.safeURL(path)?.searchParams.get("sort");
-    if (aliases.has(explicit)) return aliases.get(explicit);
-    if (replySortOverride) return replySortOverride;
-    // The native-tree integration remembers the effective order separately from
-    // Discourse's site default. Read it without changing the original preference.
-    try {
-      const saved = localStorage.getItem("ldr-native-tree:sort");
-      if (aliases.has(saved)) return aliases.get(saved);
-    } catch {}
-    return aliases.get(readerSettings().nested_replies_default_sort) || "oldest";
+    return aliases.has(explicit) ? aliases.get(explicit) : "oldest";
   }
 
   function parsePayload(value) {
@@ -1029,10 +1020,10 @@
         (state.detail?.moreError && state.detail.retryAt > Date.now()) ||
         (state.detail?.liveStatus?.error && state.detail.liveStatus.retryAt > Date.now()))) return;
     recoveryTimer = setTimeout(() => {
-      renderListFooter();
+      if (state.listError) renderListFooter();
       if (state.topicError && !state.detail) renderReading();
-      if (state.detail?.moreError) renderReplies();
-      renderLiveStatus();
+      if (state.detail?.moreError) renderReplyFooter();
+      if (state.detail?.liveStatus?.error) renderLiveStatus();
       scheduleRecovery();
     }, 1000);
   }
@@ -1072,7 +1063,9 @@
       $("#list-scroll").scrollTop = 0;
       clearTopic();
     }
-    renderList();
+    if (append) renderListFooter();
+    else renderList();
+    let updated = false;
     try {
       if (privateModes.has(state.view) && state.user === null) throw new Error("请先登录 Linux.do。");
       const data = await forum.feed(path, controller.signal, { background });
@@ -1082,6 +1075,7 @@
       state.rows = [...unique.values()];
       state.next = data.next;
       rememberTags(data.tags);
+      updated = true;
       return { progress: state.rows.length > previousCount };
     } catch (error) {
       if (!controller.signal.aborted) {
@@ -1092,7 +1086,11 @@
     } finally {
       if (!controller.signal.aborted) {
         state.listBusy = false;
-        renderList();
+        if (!append || updated) renderList();
+        else {
+          renderListFooter();
+          listPager?.check();
+        }
       }
     }
   }
@@ -1458,7 +1456,6 @@
     const detail = state.detail;
     if (!detail || !["oldest", "newest", "top"].includes(value) || detail.sort === value) return;
     detail.sort = value;
-    replySortOverride = value;
     detail.sortGeneration = (detail.sortGeneration || 0) + 1;
     detail.sortLoadPending = value === "newest" && pendingPostIds(detail).length > 0;
     if (value === "newest" && detail.retryAt <= Date.now()) detail.moreError = null;
@@ -1577,22 +1574,7 @@
       }
     }
     if (loaded) section.append(tree);
-    const pending = pendingPostIds(detail).length > 0;
-    const paused = detail.paging?.status === "paused";
-    const retrySeconds = Math.max(0, Math.ceil(((detail.retryAt || 0) - Date.now()) / 1000));
-    const footer = add(element("div", "reply-footer"), element("span", "", total == null
-      ? `已载入 ${loaded} 条回复，总数暂不可用`
-      : `已载入 ${loaded} / ${Math.max(total, loaded)} 条回复`));
-    if (paused) footer.append(element("span", "paging-paused", "自动加载已暂停：未取得高度进展或遇到重复游标，可手动继续。"));
-    else if (pending && !detail.moreError && !retrySeconds) footer.append(element("span", "", "继续滚动或手动加载，每次至多一页"));
-    if (pending || detail.moreError || paused || detail.moreBusy || retrySeconds) {
-      const more = button(detail.moreBusy ? "正在加载…" : retrySeconds ? `${retrySeconds} 秒后重试` : detail.moreError ? "重试" : "手动加载更多",
-        "more-posts", { className: "secondary-button", symbol: "down" });
-      more.disabled = !!detail.moreBusy || retrySeconds > 0;
-      footer.append(more);
-    }
-    if (detail.moreError) footer.append(element("span", "error", recoveryMessage(detail.moreError, detail.retryAt)));
-    section.append(footer);
+    section.append(populateReplyFooter(element("div", "reply-footer"), detail));
     viewport.scrollTop = position;
     if (!keepPosition && anchorFloor) {
       const replacement = section.querySelector(`[data-reply-floor="${anchorFloor}"]`);
@@ -1601,6 +1583,41 @@
     replyPager?.captureScrollPosition();
     if (restoreSortFocus) sortSelect.focus({ preventScroll: true });
     replyPager?.check();
+  }
+
+  function populateReplyFooter(footer, detail) {
+    const total = topicReplyCount(detail.data, state.selected);
+    const loaded = [...detail.posts.values()].filter(post => post.post_number > 1).length;
+    const pending = pendingPostIds(detail).length > 0;
+    const paused = detail.paging?.status === "paused";
+    const retrySeconds = Math.max(0, Math.ceil(((detail.retryAt || 0) - Date.now()) / 1000));
+    const children = [element("span", "", total == null
+      ? `已载入 ${loaded} 条回复，总数暂不可用`
+      : `已载入 ${loaded} / ${Math.max(total, loaded)} 条回复`)];
+    if (paused) children.push(element("span", "paging-paused", "自动加载已暂停：未取得高度进展或遇到重复游标，可手动继续。"));
+    else if (pending && !detail.moreError && !retrySeconds) children.push(element("span", "", "继续滚动或手动加载，每次至多一页"));
+    if (pending || detail.moreError || paused || detail.moreBusy || retrySeconds) {
+      const more = button(detail.moreBusy ? "正在加载…" : retrySeconds ? `${retrySeconds} 秒后重试` : detail.moreError ? "重试" : "手动加载更多",
+        "more-posts", { className: "secondary-button", symbol: "down" });
+      more.disabled = !!detail.moreBusy || retrySeconds > 0;
+      children.push(more);
+    }
+    if (detail.moreError) children.push(element("span", "error", recoveryMessage(detail.moreError, detail.retryAt)));
+    footer.replaceChildren(...children);
+    return footer;
+  }
+
+  function renderReplyFooter() {
+    const detail = state.detail;
+    const footer = $("#reply-section .reply-footer");
+    if (!detail || !footer) return;
+    const hadMoreFocus = root.activeElement?.dataset?.action === "more-posts" && footer.contains(root.activeElement);
+    populateReplyFooter(footer, detail);
+    if (hadMoreFocus) {
+      const more = footer.querySelector('[data-action="more-posts"]');
+      if (more && !more.disabled) more.focus({ preventScroll: true });
+    }
+    scheduleRecovery();
   }
 
   function pendingPostIds(detail) {
@@ -1623,9 +1640,9 @@
       load: () => loadReplies({ background: true }),
       onStateChange: paging => {
         detail.paging = paging;
-        // Only a safety pause needs another tree render; loading/error states
+        // Only a safety pause needs another footer render; loading/error states
         // already render from loadReplies, preserving the current anchor.
-        if (paging.status === "paused" && state.detail === detail) renderReplies();
+        if (paging.status === "paused" && state.detail === detail) renderReplyFooter();
       }
     });
   }
@@ -1644,13 +1661,17 @@
     detail.moreBusy = true;
     detail.moreError = null;
     detail.retryAt = 0;
-    renderReplies({ preservePosition });
+    let updated = false;
+    renderReplyFooter();
     try {
       const posts = await forum.postsPage(detail.data.id, ids, detail.controller.signal, { background });
       if (detail.controller.signal.aborted || state.detail !== detail) return;
       for (const id of ids) detail.attempted.add(id);
       for (const post of posts) {
-        if (!detail.live?.tombstones.has(post.id)) detail.posts.set(post.id, post);
+        if (!detail.live?.tombstones.has(post.id)) {
+          detail.posts.set(post.id, post);
+          updated = true;
+        }
       }
       return { progress: detail.posts.size > previousCount };
     } catch (error) {
@@ -1665,7 +1686,12 @@
       detail.moreBusy = false;
       detail.sortLoading = false;
       if (state.detail === detail) {
-        renderReplies({ preservePosition: preservePosition || sortGeneration !== (detail.sortGeneration || 0) });
+        if (updated || sortGeneration !== (detail.sortGeneration || 0)) {
+          renderReplies({ preservePosition: preservePosition || sortGeneration !== (detail.sortGeneration || 0) });
+        } else {
+          renderReplyFooter();
+          replyPager?.check();
+        }
         maybeLoadSortedPage();
         detail.live?.kick();
       }

@@ -372,21 +372,26 @@ test("disabled emoji selection does not advertise or open a keyboard picker", ()
 });
 
 
-test("initial reply order follows explicit sort, native preference and site default without writes", () => {
-  const native = fixture({ savedSort: "new", settings: { nested_replies_default_sort: "old" } });
-  assert.equal(native.api.initialReplySort(), "newest");
+test("initial reply order defaults to oldest regardless of native or site preference while honoring explicit sort", () => {
+  const native = fixture({ savedSort: "new", settings: { nested_replies_default_sort: "top" } });
+  assert.equal(native.api.initialReplySort(), "oldest");
   assert.equal(native.api.initialReplySort("/t/topic/123?sort=old"), "oldest");
+  assert.equal(native.api.initialReplySort("/t/topic/123?sort=new"), "newest");
   assert.equal(native.api.initialReplySort("/t/topic/123?sort=top"), "top");
-  assert.equal(native.api.initialReplySort("/t/topic/123?sort=__proto__"), "newest");
-  assert.equal(fixture({ settings: { nested_replies_default_sort: "top" } }).api.initialReplySort(), "top");
+  assert.equal(native.api.initialReplySort("/t/topic/123?sort=__proto__"), "oldest");
+  assert.equal(fixture({ settings: { nested_replies_default_sort: "top" } }).api.initialReplySort(), "oldest");
   assert.equal(fixture({ savedSort: "constructor" }).api.initialReplySort(), "oldest");
   assert.equal(native.calls.requests.length, 0); assert.equal(native.calls.changes.length, 0);
 });
 
-test("explicit reader order is retained for later topics in this homepage session", () => {
-  const f = fixture({ savedSort: "old" }); f.render();
+test("explicit reader order applies only to the current topic and does not affect later topics", () => {
+  const f = fixture({ savedSort: "new", settings: { nested_replies_default_sort: "newest" } }); f.render();
   f.api.changeReplySort("top");
-  assert.equal(f.api.initialReplySort(), "top");
+  assert.equal(f.detail.sort, "top");
+  assert.equal(f.api.initialReplySort(), "oldest");
+  f.api.changeReplySort("newest");
+  assert.equal(f.detail.sort, "newest");
+  assert.equal(f.api.initialReplySort(), "oldest");
   assert.equal(f.api.initialReplySort("/t/topic/123?sort=new"), "newest");
 });
 

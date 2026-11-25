@@ -505,6 +505,13 @@
           target.loading = "lazy";
           target.referrerPolicy = "no-referrer";
           if (source.classList.contains("emoji") || source.classList.contains("emoji-custom")) target.className = "emoji";
+          const width = Number(source.getAttribute("width"));
+          const height = Number(source.getAttribute("height"));
+          if (!target.className && Number.isInteger(width) && width > 0 && width <= 10000 &&
+              Number.isInteger(height) && height > 0 && height <= 10000) {
+            target.setAttribute("width", String(width));
+            target.setAttribute("height", String(height));
+          }
           // Recreate only our own metadata; never copy source data-* attributes.
           // Icons and oneboxes keep their original link behavior, and ordinary
           // images inside non-image links must not hijack navigation.
