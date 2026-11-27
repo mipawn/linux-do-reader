@@ -14,10 +14,26 @@ function fixture(respond = () => ({})) {
     localStorage: storage, fetch: async (url, options) => {
       calls.push({ url, options, time: clock }); active++; peak = Math.max(peak, active);
       try {
-        const { status = 200, payload = {}, retryAfter, serverDate, invalidJSON } = await respond(url, options, calls.length);
-        return { ok: status >= 200 && status < 300, status,
-          headers: { get: name => name === "Retry-After" ? retryAfter : name === "Date" ? serverDate : null },
-          json: async () => { if (invalidJSON) throw new SyntaxError("bad JSON"); return payload; } };
+        const { status = 200, payload = {}, text, headers: extraHeaders, url: responseUrl, retryAfter, serverDate, invalidJSON } = await respond(url, options, calls.length);
+        const headerMap = new Map(Object.entries(extraHeaders || {}).map(([key, value]) => [key.toLowerCase(), value]));
+        const responseHeaders = {
+          get: name => {
+            const key = String(name).toLowerCase();
+            if (headerMap.has(key)) return headerMap.get(key);
+            if (key === "retry-after") return retryAfter ?? null;
+            if (key === "date") return serverDate ?? null;
+            return null;
+          }
+        };
+        const response = {
+          ok: status >= 200 && status < 300,
+          status,
+          url: responseUrl,
+          headers: responseHeaders,
+          json: async () => { if (invalidJSON) throw new SyntaxError("bad JSON"); return payload; }
+        };
+        if (text !== undefined) response.text = async () => text;
+        return response;
       } finally { active--; }
     }
   });
@@ -588,4 +604,62 @@ test("feed propagates background policy and explicit signals so automatic pages 
   const controller = new AbortController(); controller.abort();
   await assert.rejects(f.forum.feed("/latest.json", controller.signal, { signal: new AbortController().signal, background: true }), error => error.name === "AbortError");
   assert.equal(f.calls.length, 0);
+});
+
+test("Cloudflare challenges on 429/403/503 pause without rate-limit penalty, auto-retry, or leaking URLs", async () => {
+  const cfHTML = "<html><head><title>Just a moment...</title></head><body><script>window._cf_chl_opt={};</script><script src=\"/cdn-cgi/challenge-platform/h/b/orchestrate/chl_page/v1\"></script></body></html>";
+  const cases = [
+    { status: 429, headers: { "cf-mitigated": "challenge", "content-type": "text/html; charset=UTF-8" }, text: cfHTML, retryAfter: "60" },
+    { status: 403, headers: { "content-type": "text/html" }, text: cfHTML },
+    { status: 503, headers: { "content-type": "text/html" }, text: "<html><div id=\"cf-turnstile\"></div></html>" }
+  ];
+  for (const response of cases) {
+    const f = fixture(() => response);
+    await assert.rejects(f.forum.request("/t/private-slug/991122.json"), error =>
+      error.challenge === true && error.recoverable === false && error.status === response.status &&
+      error.retryAfter === undefined && error.retryAt === undefined && /Cloudflare 人机验证/.test(error.message));
+    assert.equal(f.calls.length, 1, "503 challenge must not auto-retry");
+    assert.equal(f.forum.requestQueue.currentInterval(), 2000, "CF challenge must not trigger 4/8s pacing penalty");
+    assert.equal(f.storage.getItem("linux-do-reader-pacing"), undefined);
+    assert.equal(f.storage.getItem("linux-do-reader-retry-at"), undefined);
+    assert.equal(f.forum.requestQueue.cooldown(), 0);
+    const record = f.forum.requestQueue.diagnostics()[0];
+    assert.equal(record.challenge, true);
+    assert.equal(record.status, response.status);
+    assert.equal(record.requestSource, "话题详情");
+
+    // Subsequent foreground and cross-tab requests reject immediately without hitting fetch.
+    await assert.rejects(f.forum.request("/search.json?q=SECRET_QUERY"), error =>
+      error.challenge === true && error.requestSource === "话题详情" && error.blockedRequestSource === "搜索");
+    const other = new f.forum.RequestQueue({ now: f.now, storage: f.storage });
+    assert.ok(other.activeChallenge());
+    await assert.rejects(other.schedule(() => assert.fail("must not run")), error => error.challenge === true);
+    assert.equal(f.calls.length, 1);
+    assert.doesNotMatch(f.storage.getItem("linux-do-reader-challenge") + JSON.stringify(f.forum.requestQueue.diagnostics()), /private-slug|991122|SECRET_QUERY/);
+
+    // Clearing the challenge unlocks the queue immediately.
+    f.forum.requestQueue.clearChallenge();
+    assert.equal(f.forum.requestQueue.activeChallenge(), null);
+    assert.equal(other.activeChallenge(), null);
+  }
+});
+
+test("account() rethrows Cloudflare 403 challenge instead of treating it as logged-out guest", async () => {
+  const f = fixture(() => ({
+    status: 403,
+    headers: { "cf-mitigated": "challenge", "content-type": "text/html" },
+    text: "<html><script>window._cf_chl_opt={};</script></html>"
+  }));
+  await assert.rejects(f.forum.account(), error => error.challenge === true && error.status === 403);
+  const guest = fixture(() => ({ status: 403, payload: { errors: ["forbidden"] } }));
+  assert.equal(await guest.forum.account(), null);
+});
+
+test("plain Discourse 429 and ordinary non-CF HTML 403/200 keep existing handling", async () => {
+  const limited = fixture(() => ({ status: 429, retryAfter: "2", payload: { error_type: "rate_limit" } }));
+  await assert.rejects(limited.forum.request("/latest.json"), error => error.status === 429 && !error.challenge && error.retryAfter === 5000);
+  const plain403 = fixture(() => ({ status: 403, headers: { "content-type": "text/html" }, text: "<html><body>Forbidden</body></html>" }));
+  await assert.rejects(plain403.forum.request("/latest.json"), error => error.status === 403 && !error.challenge);
+  const html200 = fixture(() => ({ status: 200, headers: { "content-type": "text/html" }, text: "<html><body>Login</body></html>" }));
+  await assert.rejects(html200.forum.request("/bookmarks.json", { method: "POST" }), error => !error.challenge && /无法识别/.test(error.message));
 });

@@ -16,7 +16,8 @@
   const number = new Intl.NumberFormat("zh-CN", { notation: "compact" });
   const state = {
     view: "latest", category: null, tag: null, query: "", initialFeedPath: null, next: null, listGeneration: 0, rows: [], categories: new Map(), tags: new Map(),
-    user: undefined, selected: null, topicBusy: false, detail: null, openMenu: null, sidebarMenu: null, onScreen: false
+    user: undefined, selected: null, topicBusy: false, detail: null, openMenu: null, sidebarMenu: null, onScreen: false,
+    challengeCleared: false, listChallenge: false, topicChallenge: false
   };
   const outletClass = "ld-reader-active";
   let host, root, listRequest, topicRequest, outlet, modeSwitch, nativeHeader, headerObserver, listPager, replyPager;
@@ -24,6 +25,8 @@
   let nativeClient, contextRequest, imagePreview, polls;
   let recoveryTimer;
   let headerLogo;
+  const pageLoadedAt = Date.now();
+  let pageClearedChallenge = false;
   const $ = (selector) => root.querySelector(selector);
 
   function element(tag, className, content) {
@@ -407,8 +410,13 @@
   }
 
   function pauseForWrite(error, detail) {
+    if (error?.challenge || forum.requestQueue?.activeChallenge?.()) {
+      detail?.live?.pause(forum.requestQueue?.challengeError?.() || error);
+      renderChallengeBanner();
+      return;
+    }
     if (![429, 502, 503, 504].includes(error?.status)) return;
-    detail.live?.pause(forum.requestQueue.busyError());
+    detail?.live?.pause(forum.requestQueue.busyError());
     scheduleRecovery();
   }
 
@@ -850,6 +858,7 @@
             <div id="header-actions"></div>
           </div>
         </div>
+        <div id="challenge-banner" class="challenge-banner" role="alert" hidden></div>
       </header>
       <div class="workspace">
         <section class="list-pane" aria-label="话题列表">
@@ -975,6 +984,72 @@
     return row;
   }
 
+  function challengeTargetPath() {
+    return state.selected ? forum.topicPath(state.detail?.data || state.selected) : "/latest";
+  }
+
+  function renderChallengeBanner() {
+    if (!root) return;
+    const banner = $("#challenge-banner");
+    if (!banner || typeof banner.replaceChildren !== "function") return;
+    const active = forum.requestQueue?.activeChallenge?.() || null;
+    if (!active && !state.challengeCleared) {
+      banner.hidden = true;
+      banner.classList?.remove?.("cleared");
+      banner.replaceChildren();
+      return;
+    }
+    banner.hidden = false;
+    banner.classList?.toggle?.("cleared", !active && !!state.challengeCleared);
+    let message;
+    if (active) {
+      const label = active.requestSource || "原站请求";
+      const statusLabel = active.status ? `，HTTP ${active.status}` : "";
+      message = `原站触发 Cloudflare 人机验证（${label}${statusLabel}），已暂停自动请求。请在新标签页完成验证后返回重试。`;
+    } else {
+      message = "检测到原站页面已恢复访问，请点击「继续重试」恢复阅读。";
+    }
+    const actions = add(element("div", "challenge-actions"),
+      anchor("前往原站验证", challengeTargetPath(), "secondary-button", "out"),
+      button(active ? "已完成验证，重试" : "继续重试", "challenge-retry", { className: "new-topic", symbol: "refresh" }),
+      button("刷新本页", "reload-page", { className: "text-button" }));
+    banner.replaceChildren(element("span", "challenge-message", message), actions);
+  }
+
+  function clearChallengeBeforeRetry() {
+    state.challengeCleared = false;
+    forum.requestQueue?.clearChallenge?.();
+    renderChallengeBanner();
+  }
+
+  function retryAfterChallenge() {
+    clearChallengeBeforeRetry();
+    if (state.topicError && state.selected && !state.detail) selectTopic(state.selected);
+    else if (state.listError) {
+      if (state.next && state.rows.length) {
+        listPager?.resume();
+        loadList(true).catch(() => {});
+      } else loadList(false, true).catch(() => {});
+    } else if (state.detail?.moreError) {
+      replyPager?.resume();
+      loadReplies().catch(() => {});
+    } else if (state.detail?.liveStatus?.error) {
+      if (state.detail.live) state.detail.live.refresh();
+      else startTopicLive(state.detail);
+    } else {
+      notify("已解除验证暂停，请重新执行刚才的操作。");
+    }
+  }
+
+  function maybeClearChallengeFromLoadedPage() {
+    if (pageClearedChallenge) return;
+    if (!document.getElementById("main-outlet")) return;
+    if (!document.querySelector?.(".d-header") && !document.getElementById("data-preloaded")) return;
+    pageClearedChallenge = true;
+    const active = forum.requestQueue?.activeChallenge?.();
+    if (active && pageLoadedAt >= active.detectedAt) forum.requestQueue?.clearChallenge?.();
+  }
+
   function status(message, action, label = "重试") {
     return add(element("div", "status"), element("p", "", message), action && button(label, action, { className: "secondary-button" }));
   }
@@ -991,7 +1066,12 @@
     footer.replaceChildren();
     const remaining = Math.max(0, (state.listRetryAt || 0) - Date.now());
     if (state.listError) {
-      if (privateModes.has(state.view) && state.user === null) {
+      if (state.listChallenge) {
+        const retryAction = state.next && state.rows.length ? "more-topics" : "refresh";
+        footer.append(add(status(state.listError), add(element("div", "status-actions"),
+          anchor("前往原站验证", challengeTargetPath(), "secondary-button", "out"),
+          button("已完成验证，重试", retryAction, { className: "new-topic", symbol: "refresh" }))));
+      } else if (privateModes.has(state.view) && state.user === null) {
         footer.append(add(status("登录后即可查看这个列表。"), anchor("前往 Linux.do 登录", "/login", "secondary-button", "out")));
       } else {
         const error = status(recoveryMessage(state.listError, state.listRetryAt),
@@ -1056,6 +1136,7 @@
     const path = append ? state.next : state.initialFeedPath || forum.feedPath(state.view, state.category, state.tag, state.query, state.categories);
     state.listBusy = true;
     state.listError = null;
+    state.listChallenge = false;
     state.listRetryAt = 0;
     if (!append && !keepTopic) {
       state.rows = [];
@@ -1075,12 +1156,16 @@
       state.rows = [...unique.values()];
       state.next = data.next;
       rememberTags(data.tags);
+      state.challengeCleared = false;
+      renderChallengeBanner();
       updated = true;
       return { progress: state.rows.length > previousCount };
     } catch (error) {
       if (!controller.signal.aborted) {
         state.listError = error.message;
-        state.listRetryAt = error.retryAt || Date.now() + (error.retryAfter || 0);
+        state.listChallenge = !!error.challenge;
+        state.listRetryAt = error.challenge ? 0 : (error.retryAt || Date.now() + (error.retryAfter || 0));
+        renderChallengeBanner();
       }
       throw error;
     } finally {
@@ -1144,6 +1229,7 @@
     state.detail = null;
     resetReplyPager(null);
     state.topicError = null;
+    state.topicChallenge = false;
     state.topicRetryAt = 0;
     renderList();
     $("#read-scroll").scrollTop = 0;
@@ -1160,14 +1246,18 @@
         pendingFloor: initialFloor || null, moreBusy: false, sort, sortLoadPending: sort === "newest", retryAt: 0 };
       resetReplyPager(state.detail);
       rememberTags(data.tags);
+      state.challengeCleared = false;
+      renderChallengeBanner();
       renderReading();
       startTopicLive(state.detail);
       if (initialFloor && initialFloor > 1) focusPost(initialFloor, false);
     } catch (error) {
       if (controller.signal.aborted) return;
       state.topicError = error.message;
-      state.topicRetryAt = Number.isFinite(error.retryAt) ? error.retryAt : 0;
+      state.topicChallenge = !!error.challenge;
+      state.topicRetryAt = error.challenge ? 0 : (Number.isFinite(error.retryAt) ? error.retryAt : 0);
       renderReading();
+      renderChallengeBanner();
       scheduleRecovery();
     } finally {
       if (topicRequest === controller) state.topicBusy = false;
@@ -1193,6 +1283,7 @@
           if (state.detail !== detail) return;
           detail.liveStatus = live;
           renderLiveStatus();
+          renderChallengeBanner();
           if (!live.busy) {
             maybeLoadSortedPage();
             replyPager?.check();
@@ -1260,10 +1351,11 @@
       typing.append(live.presenceReady ? "暂无其他人正在回复" : "正在回复状态尚未同步");
     }
     bar.append(typing);
-    const retry = button(live.error ? "重试实时更新" : "更新回复", "refresh-posts", { className: "text-button", symbol: "refresh" });
+    const retry = button(live.challenge ? "已完成验证，重试" : live.error ? "重试实时更新" : "更新回复", "refresh-posts", { className: "text-button", symbol: "refresh" });
     retry.disabled = seconds > 0 || live.busy || live.phase === "connecting";
     const requests = button("请求记录", "menu", { value: "requests", className: "text-button" });
     requests.setAttribute("aria-expanded", "false");
+    if (live.challenge) bar.append(anchor("前往原站验证", challengeTargetPath(), "text-button", "out"));
     bar.append(retry);
     if (live.presenceError && !live.presenceUnavailable) {
       const presenceRetry = button("重试正在回复状态", "refresh-presence", { className: "text-button", symbol: "refresh" });
@@ -1302,6 +1394,13 @@
       notify(error.message);
       return;
     }
+    if (forum.requestQueue?.activeChallenge?.()) {
+      const error = forum.requestQueue.challengeError();
+      detail.live?.pause(error);
+      renderChallengeBanner();
+      notify(error.message);
+      return;
+    }
     detail.replyBusy = true;
     for (const control of root.querySelectorAll('[data-action="reply"]')) control.disabled = true;
     try {
@@ -1313,7 +1412,11 @@
       const result = await getNativeClient().reply(topic, target);
       if (result?.opened === false && !result.login && state.detail === detail) notify("原站编辑器尚未打开，请重试或在原站回复。");
     } catch (error) {
-      if (error.status === 429 || [502, 503, 504].includes(error.status) && (error.retryAfter != null || error.retryAt != null)) {
+      if (error.challenge) {
+        forum.requestQueue?.noteChallenge?.({ source: error.requestSource === "composer" ? "composer" : "draft", status: error.status });
+        if (state.detail === detail) detail.live?.pause(forum.requestQueue?.challengeError?.() || error);
+        renderChallengeBanner();
+      } else if (error.status === 429 || [502, 503, 504].includes(error.status) && (error.retryAfter != null || error.retryAt != null)) {
         const delay = Number.isFinite(error.retryAt) ? Math.max(0, error.retryAt - Date.now())
           : Number.isFinite(error.retryAfter) ? Math.max(0, error.retryAfter) : 5000;
         forum.requestQueue.defer(delay, { source: error.requestSource === "composer" ? "composer" : "draft", status: error.status });
@@ -1351,7 +1454,10 @@
       getContext: () => ({ detail: state.detail, user: state.user, onScreen: state.onScreen }),
       onChange: () => { if (state.detail && state.onScreen) refreshReadingView(); },
       onError: error => {
-        if (forum.requestQueue.cooldown()) state.detail?.live?.pause(error);
+        if (error?.challenge || forum.requestQueue?.activeChallenge?.()) {
+          state.detail?.live?.pause(forum.requestQueue?.challengeError?.() || error);
+          renderChallengeBanner();
+        } else if (forum.requestQueue.cooldown()) state.detail?.live?.pause(error);
         notify(error.message);
         scheduleRecovery();
       }
@@ -1406,9 +1512,15 @@
     toolbar.append(anchor("在 Linux.do 打开", forum.topicPath(detail?.data || selected), "original", "out"));
     if (selected.hit?.post_number > 1) toolbar.prepend(anchor("查看命中楼层", forum.topicPath(selected, selected.hit.post_number), "original", "search"));
     if (!detail) {
-      const message = state.topicError ? status(recoveryMessage(state.topicError, state.topicRetryAt), "retry-topic") : status("正在读取话题…");
-      if (state.topicError) message.querySelector("button").disabled = state.topicRetryAt > Date.now();
-      content.append(message);
+      if (state.topicError && state.topicChallenge) {
+        content.append(add(status(state.topicError), add(element("div", "status-actions"),
+          anchor("前往原站验证", challengeTargetPath(), "secondary-button", "out"),
+          button("已完成验证，重试", "retry-topic", { className: "new-topic", symbol: "refresh" }))));
+      } else {
+        const message = state.topicError ? status(recoveryMessage(state.topicError, state.topicRetryAt), "retry-topic") : status("正在读取话题…");
+        if (state.topicError) message.querySelector("button").disabled = state.topicRetryAt > Date.now();
+        content.append(message);
+      }
       return;
     }
 
@@ -1597,12 +1709,14 @@
     if (paused) children.push(element("span", "paging-paused", "自动加载已暂停：未取得高度进展或遇到重复游标，可手动继续。"));
     else if (pending && !detail.moreError && !retrySeconds) children.push(element("span", "", "继续滚动或手动加载，每次至多一页"));
     if (pending || detail.moreError || paused || detail.moreBusy || retrySeconds) {
-      const more = button(detail.moreBusy ? "正在加载…" : retrySeconds ? `${retrySeconds} 秒后重试` : detail.moreError ? "重试" : "手动加载更多",
-        "more-posts", { className: "secondary-button", symbol: "down" });
-      more.disabled = !!detail.moreBusy || retrySeconds > 0;
+      if (detail.moreChallenge) children.push(anchor("前往原站验证", challengeTargetPath(), "secondary-button", "out"));
+      const more = button(detail.moreBusy ? "正在加载…" : detail.moreChallenge ? "已完成验证，重试"
+        : retrySeconds ? `${retrySeconds} 秒后重试` : detail.moreError ? "重试" : "手动加载更多",
+        "more-posts", { className: detail.moreChallenge ? "new-topic" : "secondary-button", symbol: detail.moreChallenge ? "refresh" : "down" });
+      more.disabled = !!detail.moreBusy || (!detail.moreChallenge && retrySeconds > 0);
       children.push(more);
     }
-    if (detail.moreError) children.push(element("span", "error", recoveryMessage(detail.moreError, detail.retryAt)));
+    if (detail.moreError) children.push(element("span", "error", detail.moreChallenge ? detail.moreError : recoveryMessage(detail.moreError, detail.retryAt)));
     footer.replaceChildren(...children);
     return footer;
   }
@@ -1660,6 +1774,7 @@
     detail.sortLoading = preservePosition;
     detail.moreBusy = true;
     detail.moreError = null;
+    detail.moreChallenge = false;
     detail.retryAt = 0;
     let updated = false;
     renderReplyFooter();
@@ -1673,11 +1788,15 @@
           updated = true;
         }
       }
+      state.challengeCleared = false;
+      renderChallengeBanner();
       return { progress: detail.posts.size > previousCount };
     } catch (error) {
       if (!detail.controller.signal.aborted && state.detail === detail) {
         detail.moreError = error.message;
-        detail.retryAt = error.retryAt || Date.now() + (error.retryAfter || 0);
+        detail.moreChallenge = !!error.challenge;
+        detail.retryAt = error.challenge ? 0 : (error.retryAt || Date.now() + (error.retryAfter || 0));
+        renderChallengeBanner();
         scheduleRecovery();
       }
       throw error;
@@ -1745,6 +1864,7 @@
       if (state.view === "bookmarks") loadList(false, true).catch(() => {});
     } catch (error) {
       notify(error.message);
+      pauseForWrite(error, detail);
     } finally {
       detail.bookmarkBusy = false;
       if (state.detail === detail) renderToolbar();
@@ -1763,6 +1883,7 @@
       if (state.view === "following") loadList(false, true).catch(() => {});
     } catch (error) {
       notify(error.message);
+      pauseForWrite(error, detail);
     } finally {
       detail.levelBusy = false;
       if (state.detail === detail) renderToolbar();
@@ -1880,7 +2001,8 @@
       for (const record of [...records].reverse()) {
         const timestamp = Number.isFinite(record.startedAt) ? timeFormat.format(record.startedAt) : "时间未知";
         const nativeFailure = ["原版草稿读取", "原版编辑器"].includes(record.requestSource);
-        const result = record.completedAt == null ? "进行中" : record.status === 0 ? "网络失败或取消" : `结果码 ${record.status}`;
+        const result = record.challenge ? (record.status ? `人机验证 (${record.status})` : "人机验证")
+          : record.completedAt == null ? "进行中" : record.status === 0 ? "网络失败或取消" : `结果码 ${record.status}`;
         menu.append(add(element("div", "request-record"), element("strong", "", record.requestSource),
           element("span", "muted", `${nativeFailure ? "收到失败 " : ""}${timestamp} · ${record.background ? "后台" : "前台"}${nativeFailure ? "" : ` ${record.method}`} · ${result}`)));
       }
@@ -2087,18 +2209,22 @@
         if (row) selectTopic(row);
         break;
       }
-      case "refresh": loadList(false, true).catch(() => {}); break;
-      case "more-topics": listPager?.resume(); loadList(true).catch(() => {}); break;
-      case "retry-topic": selectTopic(state.selected); break;
+      case "challenge-retry": retryAfterChallenge(); break;
+      case "reload-page": location.reload(); break;
+      case "refresh": clearChallengeBeforeRetry(); loadList(false, true).catch(() => {}); break;
+      case "more-topics": clearChallengeBeforeRetry(); listPager?.resume(); loadList(true).catch(() => {}); break;
+      case "retry-topic": clearChallengeBeforeRetry(); selectTopic(state.selected); break;
       case "reply": void replyTo(Number(value)); break;
       case "refresh-presence":
+        clearChallengeBeforeRetry();
         state.detail?.live?.refreshPresence();
         break;
       case "refresh-posts":
+        clearChallengeBeforeRetry();
         if (state.detail?.live) state.detail.live.refresh();
         else if (state.detail) startTopicLive(state.detail);
         break;
-      case "more-posts": replyPager?.resume(); loadReplies().catch(() => {}); break;
+      case "more-posts": clearChallengeBeforeRetry(); replyPager?.resume(); loadReplies().catch(() => {}); break;
       case "bookmark": changeBookmark(); break;
       case "level": closeMenu(true); changeLevel(Number(value)); break;
       case "jump": focusPost(Number(value)); break;
@@ -2320,6 +2446,7 @@
   }
 
   function syncNativeLayout() {
+    maybeClearChallengeFromLoadedPage();
     if (!navigation.readerRoute(location.pathname)) {
       // Discourse is an SPA: leaving home must also tear down an already-open
       // reader, not just prevent the next mount. No controls/theme/layout remain.
@@ -2397,6 +2524,7 @@
     listPager?.reset();
     replyPager?.check();
     renderListFooter();
+    renderChallengeBanner();
     return true;
   }
 
@@ -2471,6 +2599,17 @@
     window.addEventListener("pagehide", () => hideReader(false, true));
     window.addEventListener("pageshow", syncNativeLayout);
     document.addEventListener("visibilitychange", () => state.detail?.live?.visibilityChanged());
+    window.addEventListener("storage", event => {
+      if (event.key !== "linux-do-reader-challenge" && event.key !== null) return;
+      const active = forum.requestQueue?.activeChallenge?.();
+      if (!active && (state.listChallenge || state.topicChallenge || state.detail?.moreChallenge ||
+          state.detail?.liveStatus?.challenge || event.oldValue)) {
+        state.challengeCleared = true;
+      } else if (active) {
+        state.challengeCleared = false;
+      }
+      if (state.onScreen && root) renderChallengeBanner();
+    });
     window.addEventListener("hashchange", () => { if (requestedURL()) openFromURL(); });
   }
 

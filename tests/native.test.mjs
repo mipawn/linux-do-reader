@@ -896,3 +896,33 @@ test("a new client reusing the same native reply model acquires its own guard th
   await f.request("dispose", {}, { clientId: "fresh" });
   assert.equal(f.composer.save, original);
 });
+
+test("native Draft CF challenge returns CF_CHALLENGE without cooldown or leaking responseText", async () => {
+  const cases = [
+    { status: 429, headers: { "cf-mitigated": "challenge", "content-type": "text/html" }, responseText: "<html>PRIVATE_SECRET_HTML</html>" },
+    { status: 403, headers: { "content-type": "text/html" }, responseText: "<html><script>window._cf_chl_opt={};</script>PRIVATE_SECRET_HTML</html>" }
+  ];
+  for (const item of cases) {
+    const f = fixture({
+      draftResponse: async () => {
+        throw {
+          jqXHR: {
+            status: item.status,
+            responseText: item.responseText,
+            getResponseHeader: key => item.headers[key] ?? item.headers[key.toLowerCase()] ?? null
+          }
+        };
+      }
+    });
+    const response = await f.request("reply", { topic: topic(), post: floor() });
+    assert.equal(response.ok, false);
+    assert.equal(response.error.code, "CF_CHALLENGE");
+    assert.equal(response.error.challenge, true);
+    assert.equal(response.error.status, item.status);
+    assert.equal(response.error.retryAfter, undefined);
+    assert.equal(response.error.retryAt, undefined);
+    assert.match(response.error.message, /Cloudflare 人机验证/);
+    assert.doesNotMatch(JSON.stringify(response), /PRIVATE_SECRET_HTML|responseText/);
+    assert.equal(f.opened.length, 0);
+  }
+});

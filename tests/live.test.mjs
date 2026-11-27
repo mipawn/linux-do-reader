@@ -689,3 +689,24 @@ test("topic stop sends owned topic cleanup even after the client's failed watch 
   assert.deepEqual(plain(f.sent.at(-1).message.payload), { watchId: watch.watchId, topicId: 123 });
   client.close();
 });
+
+test("Cloudflare challenge on presence pauses TopicSession without disabling presence permanently", async t => {
+  const f = fixture({
+    presenceEnabled: true,
+    requestResponse: () => {
+      throw Object.assign(new Error("原站触发 Cloudflare 人机验证"), { status: 403, challenge: true });
+    }
+  });
+  t.after(() => f.session.stop());
+  await f.session.start();
+  await f.clock.advance(0);
+  const status = f.session.status();
+  assert.equal(status.phase, "paused");
+  assert.equal(status.challenge, true);
+  assert.equal(status.retryAt, 0);
+  assert.equal(status.presenceUnavailable, false);
+  assert.equal(f.session.presenceEnabled, true);
+  topic(f, 3, "created", 11);
+  await f.clock.advance(60000);
+  assert.equal(f.calls.length, 1);
+});

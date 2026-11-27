@@ -74,6 +74,8 @@
       this.retryInfo = null;
       this.rateInterval = 0;
       this.rateUntil = 0;
+      this.challengeInfo = null;
+      this.challengePersisted = false;
     }
 
     diagnostics() { return this.recentRequests.map(entry => ({ ...entry })); }
@@ -115,6 +117,7 @@
       // A lock covers only this synchronous check/commit, not a delay or HTTP.
       // Pick after acquiring it so fresh content can still overtake metadata.
       this.rejectCooling();
+      this.rejectChallenged();
       if (!this.pending.length) return null;
       const delay = this.startDelay();
       if (delay > 0) return { delay };
@@ -219,9 +222,104 @@
       }
     }
 
+    activeChallenge() {
+      const now = this.now();
+      if (this.challengeInfo && (this.challengeInfo.expiresAt <= now || this.challengeInfo.expiresAt > now + 600000)) {
+        this.challengeInfo = null;
+      }
+      try {
+        if (this.storage && typeof this.storage.getItem === "function") {
+          const raw = this.storage.getItem("linux-do-reader-challenge");
+          if (!raw) {
+            if (this.challengePersisted) {
+              this.challengeInfo = null;
+              this.challengePersisted = false;
+            }
+          } else {
+            const stored = JSON.parse(raw);
+            if (stored && Number.isFinite(stored.detectedAt) && Number.isFinite(stored.expiresAt) &&
+                stored.expiresAt > now && stored.expiresAt <= now + 600000 &&
+                (!this.challengeInfo || stored.detectedAt >= this.challengeInfo.detectedAt)) {
+              this.challengeInfo = {
+                requestSource: safeSource(stored.requestSource),
+                method: safeMethod(stored.method),
+                status: safeStatus(stored.status),
+                detectedAt: stored.detectedAt,
+                expiresAt: stored.expiresAt
+              };
+              this.challengePersisted = true;
+            }
+          }
+        }
+      } catch {}
+      return this.challengeInfo ? { ...this.challengeInfo } : null;
+    }
+
+    noteChallenge(detail = {}) {
+      const now = this.now();
+      const info = {
+        requestSource: safeSource(detail.requestSource || detail.source),
+        method: safeMethod(detail.method),
+        status: safeStatus(detail.status),
+        detectedAt: now,
+        expiresAt: now + 600000
+      };
+      this.challengeInfo = info;
+      this.challengePersisted = false;
+      try {
+        this.storage?.setItem("linux-do-reader-challenge", JSON.stringify(info));
+        this.challengePersisted = true;
+      } catch {}
+      if (["draft", "composer"].includes(detail.source)) {
+        const entry = this.record(detail);
+        entry.completedAt = now;
+        entry.status = safeStatus(detail.status);
+        entry.challenge = true;
+      }
+      this.rejectChallenged();
+    }
+
+    clearChallenge() {
+      this.challengeInfo = null;
+      this.challengePersisted = false;
+      try {
+        if (typeof this.storage?.removeItem === "function") this.storage.removeItem("linux-do-reader-challenge");
+        else this.storage?.setItem("linux-do-reader-challenge", "");
+      } catch {}
+    }
+
+    challengeError(requestSource, { blocked = true } = {}) {
+      const info = this.activeChallenge();
+      const source = info?.requestSource || null;
+      const status = info?.status || 0;
+      const label = source || "来源未记录，可能来自其他标签页";
+      const statusLabel = status ? `，HTTP ${status}` : "";
+      const message = blocked
+        ? `原站需要 Cloudflare 人机验证（${label}${statusLabel}）；本次未向原站重新请求，请完成验证后重试。`
+        : `原站触发 Cloudflare 人机验证（${label}${statusLabel}），已暂停自动请求，请前往原站完成验证后重试。`;
+      const error = new Error(message);
+      Object.assign(error, {
+        status,
+        challenge: true,
+        recoverable: false,
+        requestSource: source,
+        ...(blocked ? { blockedRequestSource: safeSource(requestSource) } : {})
+      });
+      return error;
+    }
+
+    rejectChallenged() {
+      if (!this.activeChallenge()) return;
+      for (const entry of this.pending.splice(0)) {
+        entry.signal?.removeEventListener("abort", entry.abort);
+        entry.reject(this.challengeError(entry.requestSource));
+      }
+    }
+
     schedule(task, { signal, priority = 0, background = false, requestSource, method = "GET" } = {}) {
       if (signal?.aborted) return Promise.reject(signal.reason || new DOMException("Aborted", "AbortError"));
       if (this.cooldown()) return Promise.reject(this.busyError(requestSource));
+      if (this.activeChallenge()) return Promise.reject(this.challengeError(requestSource));
       return new Promise((resolve, reject) => {
         const entry = { task, signal, priority, background, requestSource, method, resolve, reject };
         entry.abort = () => {
@@ -243,6 +341,7 @@
       try {
         while (this.pending.length) {
           this.rejectCooling();
+          this.rejectChallenged();
           if (!this.pending.length) break;
           const delay = this.startDelay();
           if (delay > 0) { await this.wait(delay); continue; }
@@ -252,9 +351,17 @@
           if (!reservation?.entry) continue;
           const { entry } = reservation;
           const record = this.record(entry);
-          try { entry.resolve(await entry.task(status => { record.status = safeStatus(status); })); record.status ??= 200; }
-          catch (error) { record.status = safeStatus(error.status); entry.reject(error); }
-          finally { record.completedAt = this.now(); }
+          try {
+            entry.resolve(await entry.task((status, detail) => {
+              record.status = safeStatus(status);
+              if (detail?.challenge) record.challenge = true;
+            }));
+            record.status ??= 200;
+          } catch (error) {
+            record.status = safeStatus(error.status);
+            if (error?.challenge) record.challenge = true;
+            entry.reject(error);
+          } finally { record.completedAt = this.now(); }
         }
       } finally {
         this.running = false;
@@ -263,6 +370,18 @@
   }
 
   const requestQueue = new RequestQueue();
+
+  function isChallengeResponse(response, text, payload) {
+    const mitigated = response?.headers?.get?.("cf-mitigated") || response?.headers?.get?.("CF-Mitigated");
+    if (typeof mitigated === "string" && /\bchallenge\b/i.test(mitigated)) return true;
+    if (payload && typeof payload === "object") return false;
+    if (typeof response?.url === "string" && /\/cdn-cgi\/challenge/i.test(response.url)) return true;
+    if (typeof text !== "string" || !text) return false;
+    const contentType = response?.headers?.get?.("content-type") || response?.headers?.get?.("Content-Type") || "";
+    const looksHTML = /text\/html|application\/xhtml/i.test(contentType) || /^\s*</.test(text);
+    if (!looksHTML) return false;
+    return /(?:\/cdn-cgi\/challenge-platform\/|\b_cf_chl_opt\b|\bcf-browser-verification\b|\bchallenge-(?:running|error-title|form)\b|\bcf-turnstile\b|\bcf_chl_prog\b)/i.test(text);
+  }
 
   function retryDelay(response, payload, fallback = 5000) {
     const header = response.headers?.get("Retry-After")?.trim();
@@ -316,8 +435,21 @@
           if (controller.signal.aborted) throw controller.signal.reason;
           reportStatus(response.status);
           if (response.ok && response.status === 204) return {};
-          const payload = await response.json().catch(() => null);
+          let payload = null, rawText = "";
+          if (typeof response.text === "function") {
+            rawText = await response.text().catch(() => "");
+            if (rawText) {
+              try { payload = JSON.parse(rawText); } catch { payload = null; }
+            }
+          } else if (typeof response.json === "function") {
+            payload = await response.json().catch(() => null);
+          }
           if (controller.signal.aborted) throw controller.signal.reason;
+          if (isChallengeResponse(response, rawText, payload)) {
+            reportStatus(response.status, { challenge: true });
+            requestQueue.noteChallenge({ requestSource, method, status: response.status });
+            throw requestQueue.challengeError(requestSource, { blocked: false });
+          }
           const limited = response.status === 429 || payload?.error_type === "rate_limit";
           const retryAfter = retryDelay(response, payload, limited ? 5000 : null);
           const cooling = limited || [502, 503, 504].includes(response.status) && retryAfter !== null;
@@ -357,7 +489,7 @@
     for (let attempt = 0; ; attempt++) {
       try { return await requestQueue.schedule(perform, { signal, priority, background, requestSource, method }); }
       catch (error) {
-        if (method !== "GET" || background || signal?.aborted || error.retryAfter != null || attempt >= 1 ||
+        if (method !== "GET" || background || signal?.aborted || error.challenge || error.retryAfter != null || attempt >= 1 ||
             !(error.name === "TypeError" || [502, 503, 504].includes(error.status))) throw error;
       }
     }
@@ -389,7 +521,7 @@
     try {
       return (await request("/session/current.json", { priority: 1, ...options })).current_user || null;
     } catch (error) {
-      if ([401, 403, 404].includes(error.status)) return null;
+      if (!error.challenge && [401, 403, 404].includes(error.status)) return null;
       throw error;
     }
   }
@@ -565,7 +697,7 @@
 
   globalThis.LDForum = {
     siteURL, safeURL, dateLabel, RequestQueue, requestQueue, request, change, account, topicPath, tagInfo, categoryPath,
-    prepareCSRF,
+    prepareCSRF, isChallengeResponse,
     feedPath, feed, postsPage, sidebar, cooked
   };
 })();

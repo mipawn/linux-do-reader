@@ -585,6 +585,9 @@ test("online transient recovery is limited and never bypasses a cooldown", async
   const cooling = f.make({ load: () => { throw Object.assign(new Error("limited"), { recoverable: true, retryAfter: 2000 }); } });
   f.frame(); await settle(); f.window.emit("online"); f.frame(); await settle();
   assert.equal(cooling.calls.length, 1);
+  const challenged = f.make({ load: () => { throw Object.assign(new Error("cf challenge"), { recoverable: true, challenge: true }); } });
+  f.frame(); await settle(); f.window.emit("online"); f.frame(); await settle();
+  assert.equal(challenged.calls.length, 1);
 });
 
 test("destroy disconnects all observers, online listeners and late callbacks", async () => {

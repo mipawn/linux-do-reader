@@ -434,6 +434,20 @@
     return { opened };
   }
 
+  function isChallengeError(error, status) {
+    try {
+      const xhr = error?.jqXHR || error;
+      const mitigated = xhr?.getResponseHeader?.("cf-mitigated") || xhr?.getResponseHeader?.("CF-Mitigated");
+      if (typeof mitigated === "string" && /\bchallenge\b/i.test(mitigated)) return true;
+      const text = typeof xhr?.responseText === "string" ? xhr.responseText : "";
+      if (!text || ![403, 429, 503].includes(status)) return false;
+      const contentType = xhr?.getResponseHeader?.("content-type") || xhr?.getResponseHeader?.("Content-Type") || "";
+      const looksHTML = /text\/html|application\/xhtml/i.test(contentType) || /^\s*</.test(text);
+      if (!looksHTML) return false;
+      return /(?:\/cdn-cgi\/challenge-platform\/|\b_cf_chl_opt\b|\bcf-browser-verification\b|\bchallenge-(?:running|error-title|form)\b|\bcf-turnstile\b|\bcf_chl_prog\b)/i.test(text);
+    } catch { return false; }
+  }
+
   async function onMessage(event) {
     if (event.source !== window || event.origin !== origin) return;
     const data = event.data;
@@ -468,12 +482,15 @@
     } catch (error) {
       const statusValue = error?.status ?? error?.jqXHR?.status;
       const status = Number.isInteger(statusValue) && statusValue >= 400 && statusValue <= 599 ? statusValue : undefined;
-      const failure = error instanceof NativeError ? { code: error.code, message: error.message } : { code: "NATIVE_UNAVAILABLE", message: status === 429 ? "原站限流，已停止打开编辑器，请稍后手动重试。" : "原站编辑器暂不可用，请手动重试或使用原版页面。" };
+      const challenge = !(error instanceof NativeError) && isChallengeError(error, status);
+      const failure = error instanceof NativeError ? { code: error.code, message: error.message }
+        : challenge ? { code: "CF_CHALLENGE", challenge: true, message: "原站触发了 Cloudflare 人机验证，请前往原站完成验证后再打开编辑器。" }
+        : { code: "NATIVE_UNAVAILABLE", message: status === 429 ? "原站限流，已停止打开编辑器，请稍后手动重试。" : "原站编辑器暂不可用，请手动重试或使用原版页面。" };
       if (status) {
         failure.status = status;
         if (data.action === "reply") failure.requestSource = replyPhase === "draft" ? "draft" : "composer";
       }
-      if (status === 429 || [502, 503, 504].includes(status)) {
+      if (!challenge && (status === 429 || [502, 503, 504].includes(status))) {
         // Read the already received native AJAX headers. No retry, timer or
         // separate request is introduced; the isolated queue owns the cooldown.
         try {

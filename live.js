@@ -123,7 +123,7 @@
     status() {
       const users = [...this.presence.users.values()].filter(user => user.id !== this.currentUserId);
       return { phase: this.phase, busy: !!this.busy, pending: this.pending.size, error: this.error?.message,
-        retryAt: this.error?.retryAt || 0, users,
+        challenge: !!this.error?.challenge, retryAt: this.error?.retryAt || 0, users,
         count: this.presence.usersMode ? users.length : this.presence.count,
         presenceReady: this.presence.cursor !== null && !this.presenceError && !this.presenceNeeded,
         presenceBusy: !!this.readingPresence && this.busy,
@@ -263,7 +263,8 @@
       if (this.timer !== undefined) this.clearTimer(this.timer);
       this.timer = undefined;
       this.error = error;
-      this.error.retryAt ||= this.now() + (error.retryAfter || 0);
+      if (!error.challenge) this.error.retryAt ||= this.now() + (error.retryAfter || 0);
+      else this.error.retryAt = 0;
       this.phase = "paused";
       this.emit();
     }
@@ -280,6 +281,7 @@
       if (this.stopped || this.error || !this.isVisible() || this.busy || this.detail.moreBusy) return;
       const operation = this.nextOperation();
       if (this.forum.requestQueue.cooldown()) { this.pause(this.forum.requestQueue.busyError(operation)); return; }
+      if (this.forum.requestQueue.activeChallenge?.()) { this.pause(this.forum.requestQueue.challengeError(operation)); return; }
       this.busy = true;
       this.readingPresence = operation === "正在回复状态";
       this.lastRead = this.now();
@@ -290,7 +292,8 @@
         else if (this.pending.size) await this.readPosts();
       } catch (error) {
         if (!this.stopped && error.name !== "AbortError") {
-          const waiting = error.status === 429 || this.forum.requestQueue.cooldown() > 0 ||
+          const waiting = error.challenge || !!this.forum.requestQueue.activeChallenge?.() ||
+            error.status === 429 || this.forum.requestQueue.cooldown() > 0 ||
             error.retryAt > this.now() || Number.isFinite(error.retryAfter) && error.retryAfter > 0;
           if (this.readingPresence && !waiting) {
             this.presenceNeeded = false;
@@ -495,6 +498,10 @@
         this.pause(this.forum.requestQueue.busyError("正在回复状态"));
         return false;
       }
+      if (this.forum.requestQueue.activeChallenge?.()) {
+        this.pause(this.forum.requestQueue.challengeError("正在回复状态"));
+        return false;
+      }
       this.presenceManual = true;
       this.presenceNeeded = true;
       this.kick(0);
@@ -505,6 +512,7 @@
     refresh() {
       if (this.stopped) return;
       if (this.forum.requestQueue.cooldown()) { this.pause(this.forum.requestQueue.busyError("实时更新")); return; }
+      if (this.forum.requestQueue.activeChallenge?.()) { this.pause(this.forum.requestQueue.challengeError("实时更新")); return; }
       if (this.error?.retryAt > this.now()) return;
       this.error = null;
       this.presenceError = null;

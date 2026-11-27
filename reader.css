@@ -178,6 +178,25 @@ time, .metrics, .reply-count, .floor { font-variant-numeric: tabular-nums; }
 }
 .new-topic { background: var(--accent-soft); color: var(--accent-text); border-color: var(--border-strong); font-weight: 680; }
 .new-topic:hover { border-color: var(--accent-line); }
+.challenge-banner {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 14px;
+  padding: 9px clamp(16px, 2.25vw, 36px);
+  border-bottom: 1px solid color-mix(in srgb, var(--danger) 32%, var(--border));
+  background: color-mix(in srgb, var(--danger) 9%, var(--paper));
+  color: var(--ink);
+  font-size: 12px;
+}
+.challenge-banner.cleared {
+  border-bottom-color: var(--accent-line);
+  background: var(--accent-soft);
+}
+.challenge-message { flex: 1 1 260px; overflow-wrap: anywhere; }
+.challenge-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.status-actions { display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: 8px; }
 
 .workspace { display: grid; grid-template-columns: minmax(300px, 33%) minmax(0, 1fr); min-height: 0; }
 .shell:not([data-reading="true"]) .workspace { grid-template-columns: minmax(0, 1fr); }

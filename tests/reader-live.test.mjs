@@ -80,16 +80,17 @@ const post = (floor, extra = {}) => ({ id: 100 + floor, topic_id: 123, post_numb
 function fixture({ posts = [post(1), post(2)], user = { id: 7 }, data: changes = {}, reply, nativeContext,
   url = "https://linux.do/", livePending = new Set(), page, topicResponse, records = [], preloaded, changeResponse } = {}) {
   const root = new Node("root"); root._connected = true;
-  const shell = new Node("div", "shell"), toolbar = new Node(), actions = new Node(), reading = new Node(), status = new Node(), scroll = new Node();
+  const shell = new Node("div", "shell"), toolbar = new Node(), actions = new Node(), reading = new Node(), status = new Node(), scroll = new Node(), challengeBanner = new Node("div", "challenge-banner");
   actions.id = "reading-actions"; reading.id = "reading"; status.id = "live-status"; status.hidden = true; scroll.id = "read-scroll";
-  toolbar.append(actions); scroll.append(reading); shell.append(toolbar, status, scroll); root.append(shell);
+  challengeBanner.id = "challenge-banner"; challengeBanner.hidden = true;
+  toolbar.append(actions); scroll.append(reading); shell.append(challengeBanner, toolbar, status, scroll); root.append(shell);
   const menu = new Node(); menu.id = "menu"; root.append(menu);
   const data = { id: 123, title: "Title", slug: "topic", posts_count: posts.length, message_bus_last_id: 10, chunk_size: 20,
     draft_key: "topic_123", draft_sequence: 4, tags: [], details: { can_create_post: true, notification_level: 1 }, ...changes };
   const detail = { data, posts: new Map(posts.map(value => [value.id, value])), stream: posts.map(value => value.id),
     attempted: new Set(posts.map(value => value.id)), collapsed: new Set(), sort: "oldest", controller: new AbortController(), retryAt: 0 };
-  const calls = { reply: [], requests: [], pages: [], cooked: [], context: 0, notifications: [], sessions: [], stopped: 0, refreshed: 0, kicked: 0, paused: [], deferred: [], deferredInfo: [], changes: [] };
-  let cooling = 0;
+  const calls = { reply: [], requests: [], pages: [], cooked: [], context: 0, notifications: [], sessions: [], stopped: 0, refreshed: 0, kicked: 0, paused: [], deferred: [], deferredInfo: [], notedChallenges: [], clearedChallenges: 0, changes: [] };
+  let cooling = 0, challengeState = null;
   const bridge = {
     async reply(...args) { calls.reply.push(plain(args)); return reply ? reply(...args) : { opened: true }; },
     async context() { calls.context++; return nativeContext ?? { user, categories: [], tags: [], presenceEnabled: true }; },
@@ -118,6 +119,10 @@ function fixture({ posts = [post(1), post(2)], user = { id: 7 }, data: changes =
       return changeResponse || {};
     },
     requestQueue: { cooldown: () => cooling, busyError: () => Object.assign(new Error("原站限流"), { status: 429, retryAt: Date.now() + cooling, retryAfter: cooling }),
+      activeChallenge: () => challengeState,
+      noteChallenge: (info = {}) => { challengeState = { requestSource: "话题详情", status: info.status || 429, ...info }; calls.notedChallenges.push(plain(info)); },
+      clearChallenge: () => { challengeState = null; calls.clearedChallenges++; },
+      challengeError: () => Object.assign(new Error("原站触发 Cloudflare 人机验证"), { status: challengeState?.status || 429, challenge: true }),
       diagnostics: () => records,
       defer: (delay, options = {}) => { cooling = Math.max(cooling, delay); calls.deferred.push(delay); calls.deferredInfo.push(plain(options)); } }
   };
@@ -140,13 +145,15 @@ function fixture({ posts = [post(1), post(2)], user = { id: 7 }, data: changes =
     notify = message => __calls.notifications.push(message);
     globalThis.readerTest = { state, renderReading, renderReplies, renderReplyFooter, replyTo, clicked, startTopicLive,
       pendingPostIds, loadReplies, changeReplySort, maybeLoadSortedPage, loadContext, clearTopic, selectTopic, canReply, populateMenu,
-      openMenu, toggleReaction, submitBoost, deleteBoost, postByFloor, boostStats };
+      openMenu, toggleReaction, submitBoost, deleteBoost, postByFloor, boostStats, renderChallengeBanner, challengeTargetPath, retryAfterChallenge };
     const requestedAtStart = false;
   `);
   vm.runInContext(script, context);
   const api = context.readerTest;
   return { api, calls, detail, root, scroll, status, actions, location, document,
-    cooldown: delay => { cooling = delay; }, render: () => api.renderReading(),
+    cooldown: delay => { cooling = delay; },
+    challenge: info => { challengeState = info; },
+    render: () => api.renderReading(),
     controls: () => root.querySelectorAll('[data-action="reply"]'), live: () => api.startTopicLive(api.state.detail) };
 }
 
@@ -1003,4 +1010,55 @@ test("failed reply pagination and cooldown countdown ticks update only .reply-fo
   assert.deepEqual(f.root.querySelectorAll(".reply-card"), cardsBefore);
   assert.equal(f.scroll.scrollTop, 240);
   assert.match(source("reader.js"), /if \(state\.detail\?\.moreError\) renderReplyFooter\(\);/);
+});
+
+test("topic CF challenge renders verify link, banner, and retries cleanly without countdown lock", async () => {
+  let challenged = true;
+  const f = fixture({
+    topicResponse: () => {
+      if (challenged) {
+        f.challenge({ requestSource: "话题详情", status: 429 });
+        throw Object.assign(new Error("原站触发 Cloudflare 人机验证（话题详情，HTTP 429），已暂停自动请求。"), { status: 429, challenge: true });
+      }
+    }
+  });
+  f.api.state.selected = null;
+  f.api.state.detail = null;
+  await f.api.selectTopic({ id: 123, title: "Title" });
+  assert.equal(f.api.state.topicChallenge, true);
+  assert.equal(f.api.state.topicRetryAt, 0);
+  assert.equal(f.root.querySelector("#challenge-banner").hidden, false);
+  const retryButton = f.root.querySelector('[data-action="retry-topic"]');
+  assert.notEqual(retryButton.disabled, true);
+  const verifyLink = f.root.querySelector("#reading a.secondary-button");
+  assert.equal(verifyLink.href, "https://linux.do/t/topic/123");
+  challenged = false;
+  f.api.clicked({ target: retryButton });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(f.calls.clearedChallenges, 1);
+  assert.equal(f.calls.requests.length, 2);
+  assert.ok(f.api.state.detail);
+  assert.equal(f.root.querySelector("#challenge-banner").hidden, true);
+});
+
+test("diagnostic menu marks challenge records and write challenge pauses without replaying writes", async () => {
+  const f = fixture({
+    records: [
+      { requestSource: "话题详情", method: "GET", background: false, startedAt: 0, completedAt: 10, status: 429, challenge: true }
+    ],
+    reply: () => {
+      throw Object.assign(new Error("原站触发了 Cloudflare 人机验证"), { status: 403, challenge: true, requestSource: "draft" });
+    }
+  });
+  f.render(); f.live();
+  f.api.populateMenu("requests");
+  assert.match(f.root.querySelector("#menu").textContent, /人机验证 \(429\)/);
+
+  await f.api.replyTo(0);
+  assert.equal(f.calls.notedChallenges.length, 1);
+  assert.equal(f.calls.deferred.length, 0);
+  assert.equal(f.calls.paused.length, 1);
+  assert.equal(f.root.querySelector("#challenge-banner").hidden, false);
+  f.api.retryAfterChallenge();
+  assert.equal(f.calls.reply.length, 1, "retrying after challenge never replays a write");
 });

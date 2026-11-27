@@ -41,7 +41,7 @@
         // One online transition may recover a transient failure. Repeated online
         // events cannot become an unbounded error/retry loop.
         if (this.state.status === "error" && this.state.error?.recoverable &&
-            this.state.retryAt <= this.now() && this.onlineRetries < 1) {
+            !this.state.error?.challenge && this.state.retryAt <= this.now() && this.onlineRetries < 1) {
           this.onlineRetries++;
           this.recover(false);
         }
